@@ -8,6 +8,11 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from openai import OpenAI
 
+import asyncio
+import random
+from datetime import datetime
+import pytz
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("lia-bot")
 
