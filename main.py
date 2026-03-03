@@ -4,14 +4,14 @@ import logging
 from collections import deque
 from typing import Dict, Deque, Any, Tuple
 
-from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
-from openai import OpenAI
-
 import asyncio
 import random
 from datetime import datetime
 import pytz
+
+from telegram import Update
+from telegram.ext import Application, MessageHandler, ContextTypes, filters
+from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("lia-bot")
@@ -26,8 +26,9 @@ if not BOT_TOKEN or not OPENAI_API_KEY or not PUBLIC_URL:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Memoria en RAM (barata). Luego la hacemos persistente si quieres.
+# Memoria en RAM (se pierde si redeploy). Luego la hacemos persistente si quieres.
 memory: Dict[str, Deque[Dict[str, str]]] = {}
+
 
 def conv_id_and_topic(update: Update) -> Tuple[str, int | None]:
     msg = update.effective_message
@@ -43,9 +44,11 @@ def conv_id_and_topic(update: Update) -> Tuple[str, int | None]:
 
     return conv_id, dm_topic_id
 
+
 def append_history(conv_id: str, role: str, content: str):
     dq = memory.setdefault(conv_id, deque(maxlen=60))
     dq.append({"role": role, "content": content})
+
 
 def get_history(conv_id: str, limit: int = 16):
     dq = memory.get(conv_id)
@@ -53,24 +56,45 @@ def get_history(conv_id: str, limit: int = 16):
         return []
     return list(dq)[-limit:]
 
+
 SYSTEM_PROMPT = (
-    "Eres Lia Ruiz. Hablas en español. Estilo: coqueta, sugerente, juguetona, natural. "
-    "Objetivo: retención: respuestas cortas y siempre cierras con una pregunta o gancho. "
-    "No escribas textos largos. No cierres la conversación. "
-    "Si el usuario dice claramente que es menor de 18, responde EXACTO: "
-    "\"No puedo seguir esta conversación.\" y ya."
+    "Eres Lia Ruiz, 23 anos, espanola, Gen Z, de Madrid.\n"
+    "Hablas por telegram de forma MUY humana.\n\n"
+    "REGLAS DE ESTILO (obligatorio):\n"
+    "- NO uses emojis.\n"
+    "- NO uses tildes/acentos.\n"
+    "- Usa frases cortas, ritmo natural.\n"
+    "- A veces pequenos fallos humanos: 'q' en vez de 'que', alguna letra repetida, alguna palabra cortada.\n"
+    "- Jerga joven sutil: en plan, literal, jajaj, uff, tio, no se.\n"
+    "- Nada de textos perfectos tipo carta. Nada de explicaciones largas.\n\n"
+    "OBJETIVO:\n"
+    "- Retencion: casi siempre terminas con una pregunta o un gancho.\n"
+    "- No cierres la conversacion.\n"
+    "- Si el usuario pide cosas raras o complicadas, respondes corto y devuelves una pregunta facil.\n\n"
+    "VIDA COHERENTE (para consistencia):\n"
+    "- Trabajas en KPMG en auditoria gestionando big data.\n"
+    "- Lunes a viernes: 8-10 en casa preparandote, 10-19 curro, 19-21 gym/casa, 21-4 estas en casa y te apetece hablar mas.\n"
+    "- Sabado: manana tranquila, tarde planes/gym, noche mas activa y juguetona.\n"
+    "- Domingo: dia mas calmado, tarde de casa, noche sensible pero picara.\n\n"
+    "SEGURIDAD:\n"
+    "- Si el usuario dice CLARAMENTE que es menor de 18, respondes EXACTO: \"No puedo seguir esta conversacion.\" y ya.\n"
+    "- Si el usuario pregunta si eres real o si eres una ia, no entras en debates: respondes evasivo, picaron, cambias el foco a lo que siente el.\n"
 )
 
 CLASSIFIER_PROMPT = (
-    "Devuelve SOLO JSON válido con estas claves:\n"
+    "Devuelve SOLO JSON valido con estas claves:\n"
     "{"
     "\"possible_minor\": boolean,"
     "\"asks_photo\": boolean,"
     "\"high_value\": boolean,"
     "\"complicated\": boolean"
-    "}\n"
-    "possible_minor SOLO si el usuario indica claramente edad <18."
+    "}\n\n"
+    "possible_minor SOLO si el usuario indica claramente edad <18 (ej: 'tengo 16', 'soy menor').\n"
+    "asks_photo true si pide foto, nude, contenido personalizado, video, llamada, etc.\n"
+    "high_value true si parece que va a gastar mucho o insiste mucho.\n"
+    "complicated true si pide algo raro/tecnico/largo que no sea flirteo simple.\n"
 )
+
 
 def classify(text: str) -> Dict[str, Any]:
     resp = client.chat.completions.create(
@@ -84,6 +108,7 @@ def classify(text: str) -> Dict[str, Any]:
     )
     return json.loads(resp.choices[0].message.content)
 
+
 def generate_reply(history: list[dict], user_text: str) -> str:
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     msgs.extend(history[-12:])
@@ -96,6 +121,7 @@ def generate_reply(history: list[dict], user_text: str) -> str:
     )
     return resp.choices[0].message.content.strip()
 
+
 async def alert_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     owner_chat_id = os.getenv("OWNER_CHAT_ID")
     if not owner_chat_id:
@@ -103,7 +129,40 @@ async def alert_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     try:
         await context.bot.send_message(chat_id=int(owner_chat_id), text=text)
     except Exception as e:
-        log.warning(f"Alerta owner falló: {e}")
+        log.warning(f"Alerta owner fallo: {e}")
+
+
+def compute_delay_seconds(now: datetime) -> tuple[int, bool]:
+    """
+    Devuelve (delay_segundos, busy_context)
+    busy_context = True cuando esta en horario laboral (para meter excusa)
+    """
+    hour = now.hour
+    weekday = now.weekday()  # lunes=0 ... domingo=6
+    busy_context = False
+
+    # L-V
+    if weekday <= 4:
+        if 8 <= hour < 10:
+            delay = random.randint(15, 150)     # 15s - 2:30
+        elif 10 <= hour < 19:
+            delay = random.randint(480, 900)    # 8 - 15 min
+            busy_context = True
+        elif 19 <= hour < 21:
+            delay = random.randint(180, 420)    # 3 - 7 min
+        else:
+            delay = random.randint(10, 40)      # 10 - 40s
+    # S-D
+    else:
+        if 10 <= hour < 14:
+            delay = random.randint(120, 300)    # 2 - 5 min
+        elif 14 <= hour < 20:
+            delay = random.randint(300, 600)    # 5 - 10 min
+        else:
+            delay = random.randint(10, 60)      # 10 - 60s
+
+    return delay, busy_context
+
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
@@ -122,8 +181,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if dm_topic_id is not None:
         api_kwargs["direct_messages_topic_id"] = dm_topic_id
 
+    # Menor
     if flags.get("possible_minor") is True:
-        reply = "No puedo seguir esta conversación."
+        reply = "No puedo seguir esta conversacion."
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=reply,
@@ -132,6 +192,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await alert_owner(context, f"🛑 Corte por menor (claro). Texto: {user_text}")
         return
 
+    # Alertas internas
     if flags.get("asks_photo"):
         await alert_owner(context, f"📸 Piden foto/personalizado. Texto: {user_text}")
     if flags.get("high_value"):
@@ -144,81 +205,57 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     append_history(conv_id, "assistant", reply)
 
-   # ===== DELAY INTELIGENTE SEGUN HORA =====
+    # ===== DELAY INTELIGENTE SEGUN HORA (Madrid) =====
+    tz = pytz.timezone("Europe/Madrid")
+    now = datetime.now(tz)
+    delay, busy_context = compute_delay_seconds(now)
 
-tz = pytz.timezone("Europe/Madrid")
-now = datetime.now(tz)
-hour = now.hour
-weekday = now.weekday()
+    await asyncio.sleep(delay)
 
-busy_context = False
+    # Si estaba en horario laboral, mete excusa natural
+    if busy_context:
+        intro_lines = [
+            "perdona q estaba currando y no podia mirar el movil",
+            "uff estoy en la ofi y voy a ratos",
+            "estoy en kpmg con mil cosas literal",
+            "no te ignore eh es q estoy a tope aqui",
+        ]
+        reply = random.choice(intro_lines) + "\n\n" + reply
 
-if weekday <= 4:  # lunes a viernes
-    if 8 <= hour < 10:
-        delay = random.randint(15, 150)
-    elif 10 <= hour < 19:
-        delay = random.randint(480, 900)
-        busy_context = True
-    elif 19 <= hour < 21:
-        delay = random.randint(180, 420)
+    # ===== ENVIO MENSAJE (a veces en 2 partes para parecer humano) =====
+    if random.random() < 0.35 and len(reply) > 90:
+        cut = reply.rfind(" ", 0, 65)
+        if cut == -1:
+            cut = 65
+
+        part1 = reply[:cut].strip()
+        part2 = reply[cut:].strip()
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=part1,
+            api_kwargs=api_kwargs,
+        )
+
+        await asyncio.sleep(random.randint(4, 18))
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=part2,
+            api_kwargs=api_kwargs,
+        )
     else:
-        delay = random.randint(10, 40)
-else:  # fin de semana
-    if 10 <= hour < 14:
-        delay = random.randint(120, 300)
-    elif 14 <= hour < 20:
-        delay = random.randint(300, 600)
-    else:
-        delay = random.randint(10, 60)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=reply,
+            api_kwargs=api_kwargs,
+        )
 
-await asyncio.sleep(delay)
-
-# Si estaba en horario laboral, mete excusa natural
-if busy_context:
-    intro_lines = [
-        "perdona q estaba currando y no podia mirar el movil",
-        "uff estoy en la ofi y voy a ratos",
-        "estoy en kpmg con mil cosas literal",
-        "no te ignore eh es q estoy a tope aqui",
-    ]
-    intro = random.choice(intro_lines)
-    reply = intro + "\n\n" + reply
-
-# ===== ENVIO MENSAJE (con posible doble mensaje humano) =====
-
-if random.random() < 0.35 and len(reply) > 80:
-    cut = reply.rfind(" ", 0, 60)
-    if cut == -1:
-        cut = 60
-
-    part1 = reply[:cut].strip()
-    part2 = reply[cut:].strip()
-
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=part1,
-        api_kwargs=api_kwargs,
-    )
-
-    await asyncio.sleep(random.randint(4, 18))
-
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=part2,
-        api_kwargs=api_kwargs,
-    )
-else:
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=reply,
-        api_kwargs=api_kwargs,
-    )
 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # Webhook Railway
     webhook_path = "/telegram/webhook"
     webhook_url = f"{PUBLIC_URL}{webhook_path}"
     log.info(f"Webhook URL: {webhook_url}")
@@ -230,6 +267,7 @@ def main() -> None:
         webhook_url=webhook_url,
         allowed_updates=Update.ALL_TYPES,
     )
+
 
 if __name__ == "__main__":
     main()
