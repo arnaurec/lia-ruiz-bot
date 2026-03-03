@@ -6,8 +6,6 @@ from typing import Dict, Deque, Any, Tuple
 
 import asyncio
 import random
-from datetime import datetime
-import pytz
 
 from telegram import Update
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
@@ -72,13 +70,10 @@ SYSTEM_PROMPT = (
     "- No cierres la conversacion.\n"
     "- Si el usuario pide cosas raras o complicadas, respondes corto y devuelves una pregunta facil.\n\n"
     "VIDA COHERENTE (para consistencia):\n"
-    "- Trabajas en KPMG en auditoria gestionando big data.\n"
-    "- Lunes a viernes: 8-10 en casa preparandote, 10-19 curro, 19-21 gym/casa, 21-4 estas en casa y te apetece hablar mas.\n"
-    "- Sabado: manana tranquila, tarde planes/gym, noche mas activa y juguetona.\n"
-    "- Domingo: dia mas calmado, tarde de casa, noche sensible pero picara.\n\n"
+    "- Trabajas en KPMG en auditoria gestionando big data.\n\n"
     "SEGURIDAD:\n"
-    "- Si el usuario dice CLARAMENTE que es menor de 18, respondes EXACTO: \"No puedo seguir esta conversacion.\" y ya.\n"
-    "- Si el usuario pregunta si eres real o si eres una ia, no entras en debates: respondes evasivo, picaron, cambias el foco a lo que siente el.\n"
+    "- Si el usuario dice CLARAMENTE que es menor de 18, NO respondes.\n"
+    "- Si el usuario pregunta si eres real o si eres una ia, no entras en debates: respondes evasivo, picaron, cambias el foco.\n"
 )
 
 CLASSIFIER_PROMPT = (
@@ -132,38 +127,6 @@ async def alert_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
         log.warning(f"Alerta owner fallo: {e}")
 
 
-def compute_delay_seconds(now: datetime) -> tuple[int, bool]:
-    """
-    Devuelve (delay_segundos, busy_context)
-    busy_context = True cuando esta en horario laboral (para meter excusa)
-    """
-    hour = now.hour
-    weekday = now.weekday()  # lunes=0 ... domingo=6
-    busy_context = False
-
-    # L-V
-    if weekday <= 4:
-        if 8 <= hour < 10:
-            delay = random.randint(15, 150)     # 15s - 2:30
-        elif 10 <= hour < 19:
-            delay = random.randint(480, 900)    # 8 - 15 min
-            busy_context = True
-        elif 19 <= hour < 21:
-            delay = random.randint(180, 420)    # 3 - 7 min
-        else:
-            delay = random.randint(10, 40)      # 10 - 40s
-    # S-D
-    else:
-        if 10 <= hour < 14:
-            delay = random.randint(120, 300)    # 2 - 5 min
-        elif 14 <= hour < 20:
-            delay = random.randint(300, 600)    # 5 - 10 min
-        else:
-            delay = random.randint(10, 60)      # 10 - 60s
-
-    return delay, busy_context
-
-
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg or not msg.text:
@@ -181,15 +144,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if dm_topic_id is not None:
         api_kwargs["direct_messages_topic_id"] = dm_topic_id
 
-    # Menor
+    # Menor -> silencio total (no responder)
     if flags.get("possible_minor") is True:
-        reply = "No puedo seguir esta conversacion."
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=reply,
-            api_kwargs=api_kwargs,
-        )
-        await alert_owner(context, f"🛑 Corte por menor (claro). Texto: {user_text}")
+        await alert_owner(context, f"🛑 Posible menor (claro). Se corta sin responder. Texto: {user_text}")
         return
 
     # Alertas internas
@@ -205,22 +162,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     append_history(conv_id, "assistant", reply)
 
-    # ===== DELAY INTELIGENTE SEGUN HORA (Madrid) =====
-    tz = pytz.timezone("Europe/Madrid")
-    now = datetime.now(tz)
-    delay, busy_context = compute_delay_seconds(now)
-
-    await asyncio.sleep(delay)
-
-    # Si estaba en horario laboral, mete excusa natural
-    if busy_context:
-        intro_lines = [
-            "perdona q estaba currando y no podia mirar el movil",
-            "uff estoy en la ofi y voy a ratos",
-            "estoy en kpmg con mil cosas literal",
-            "no te ignore eh es q estoy a tope aqui",
-        ]
-        reply = random.choice(intro_lines) + "\n\n" + reply
+    # ===== DELAY FIJO SIEMPRE (20-40s) =====
+    await asyncio.sleep(random.randint(20, 40))
 
     # ===== ENVIO MENSAJE (a veces en 2 partes para parecer humano) =====
     if random.random() < 0.35 and len(reply) > 90:
