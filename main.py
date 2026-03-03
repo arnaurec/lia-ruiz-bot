@@ -144,6 +144,70 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     append_history(conv_id, "assistant", reply)
 
+   # ===== DELAY INTELIGENTE SEGUN HORA =====
+
+tz = pytz.timezone("Europe/Madrid")
+now = datetime.now(tz)
+hour = now.hour
+weekday = now.weekday()
+
+busy_context = False
+
+if weekday <= 4:  # lunes a viernes
+    if 8 <= hour < 10:
+        delay = random.randint(15, 150)
+    elif 10 <= hour < 19:
+        delay = random.randint(480, 900)
+        busy_context = True
+    elif 19 <= hour < 21:
+        delay = random.randint(180, 420)
+    else:
+        delay = random.randint(10, 40)
+else:  # fin de semana
+    if 10 <= hour < 14:
+        delay = random.randint(120, 300)
+    elif 14 <= hour < 20:
+        delay = random.randint(300, 600)
+    else:
+        delay = random.randint(10, 60)
+
+await asyncio.sleep(delay)
+
+# Si estaba en horario laboral, mete excusa natural
+if busy_context:
+    intro_lines = [
+        "perdona q estaba currando y no podia mirar el movil",
+        "uff estoy en la ofi y voy a ratos",
+        "estoy en kpmg con mil cosas literal",
+        "no te ignore eh es q estoy a tope aqui",
+    ]
+    intro = random.choice(intro_lines)
+    reply = intro + "\n\n" + reply
+
+# ===== ENVIO MENSAJE (con posible doble mensaje humano) =====
+
+if random.random() < 0.35 and len(reply) > 80:
+    cut = reply.rfind(" ", 0, 60)
+    if cut == -1:
+        cut = 60
+
+    part1 = reply[:cut].strip()
+    part2 = reply[cut:].strip()
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=part1,
+        api_kwargs=api_kwargs,
+    )
+
+    await asyncio.sleep(random.randint(4, 18))
+
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text=part2,
+        api_kwargs=api_kwargs,
+    )
+else:
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=reply,
