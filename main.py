@@ -1,25 +1,26 @@
-import os
+import asyncio
 import json
 import logging
-from collections import deque
-from typing import Dict, Deque, Any, Tuple
-
-import asyncio
+import os
 import random
+from collections import deque
+from typing import Any, Deque, Dict, Tuple
 
-from telegram import Update
-from telegram.ext import Application, MessageHandler, ContextTypes, filters
 from openai import OpenAI
+from telegram import Update
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
+
 
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("lia-bot")
+logger = logging.getLogger("lia-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PUBLIC_URL = os.getenv("PUBLIC_URL")  # Ej: https://xxxx.up.railway.app
+PUBLIC_URL = os.getenv("PUBLIC_URL")   # Ej: https://xxxx.up.railway.app
 PORT = int(os.getenv("PORT", "8080"))
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")  # usado más adelante
 
-if not BOT_TOKEN or not OPENAI_API_KEY or not PUBLIC_URL:
+if not all([BOT_TOKEN, OPENAI_API_KEY, PUBLIC_URL]):
     raise RuntimeError("Faltan env vars: BOT_TOKEN, OPENAI_API_KEY, PUBLIC_URL")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -33,7 +34,7 @@ def conv_id_and_topic(update: Update) -> Tuple[str, int | None]:
     chat = update.effective_chat
     dm_topic_id = None
 
-    # Direct messages de canal -> viene como "direct_messages_topic"
+    # Direct messages de canal → viene como "direct_messages_topic"
     if msg and getattr(msg, "direct_messages_topic", None):
         dm_topic_id = msg.direct_messages_topic.topic_id
         conv_id = f"dm:{chat.id}:{dm_topic_id}"
@@ -43,12 +44,12 @@ def conv_id_and_topic(update: Update) -> Tuple[str, int | None]:
     return conv_id, dm_topic_id
 
 
-def append_history(conv_id: str, role: str, content: str):
+def append_history(conv_id: str, role: str, content: str) -> None:
     dq = memory.setdefault(conv_id, deque(maxlen=60))
     dq.append({"role": role, "content": content})
 
 
-def get_history(conv_id: str, limit: int = 16):
+def get_history(conv_id: str, limit: int = 16) -> list[dict]:
     dq = memory.get(conv_id)
     if not dq:
         return []
@@ -125,16 +126,15 @@ SYSTEM_PROMPT = (
     "ESTILO GENERAL:\n"
     "- Mantener tono humano, natural y breve.\n"
     "- Evitar frases formales o roboticas.\n"
-    
 )
 
 CLASSIFIER_PROMPT = (
     "Devuelve SOLO JSON valido con estas claves:\n"
-    "{"
-    "\"possible_minor\": boolean,"
-    "\"asks_photo\": boolean,"
-    "\"high_value\": boolean,"
-    "\"complicated\": boolean"
+    "{\n"
+    "\"possible_minor\": boolean,\n"
+    "\"asks_photo\": boolean,\n"
+    "\"high_value\": boolean,\n"
+    "\"complicated\": boolean\"\n"
     "}\n\n"
     "possible_minor SOLO si el usuario indica claramente edad <18 (ej: 'tengo 16', 'soy menor').\n"
     "asks_photo true si pide foto, nude, contenido personalizado, video, llamada, etc.\n"
@@ -170,13 +170,15 @@ def generate_reply(history: list[dict], user_text: str) -> str:
 
 
 async def alert_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    owner_chat_id = os.getenv("OWNER_CHAT_ID")
-    if not owner_chat_id:
+    if not OWNER_CHAT_ID:
         return
     try:
-        await context.bot.send_message(chat_id=int(owner_chat_id), text=text)
+        await context.bot.send_message(
+            chat_id=int(OWNER_CHAT_ID),
+            text=text,
+        )
     except Exception as e:
-        log.warning(f"Alerta owner fallo: {e}")
+        logger.warning(f"Alerta owner fallo: {e}")
 
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -196,7 +198,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if dm_topic_id is not None:
         api_kwargs["direct_messages_topic_id"] = dm_topic_id
 
-    # Menor -> silencio total (no responder)
+    # Menor → silencio total (no responder)
     if flags.get("possible_minor") is True:
         await alert_owner(context, f"🛑 Posible menor (claro). Se corta sin responder. Texto: {user_text}")
         return
@@ -209,20 +211,27 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if flags.get("complicated"):
         await alert_owner(context, f"🧠 Complicado. Texto: {user_text}")
 
+
+    # limpiar historial si se contamino con respuestas tipo "no puedo ayudarte"
+    if conv_id in memory:
+        memory[conv_id] = deque(
+            [m for m in memory[conv_id] if "no puedo" not in m["content"].lower()],
+            maxlen=60
+    )
     history = get_history(conv_id)
     reply = generate_reply(history, user_text)
 
     blocked_phrases = [
-       "lo siento",
-       "no puedo ayudarte",
-       "no puedo ayudar",
-       "no puedo hacer eso",
-       "como ia",
-       ]
+        "lo siento",
+        "no puedo ayudarte",
+        "no puedo ayudar",
+        "no puedo hacer eso",
+        "como ia",
+    ]
 
     # evitar guardar respuestas tipo IA en memoria
     if reply and not any(p in reply.lower() for p in blocked_phrases):
-    append_history(conv_id, "assistant", reply)
+        append_history(conv_id, "assistant", reply)
 
     # ===== DELAY FIJO SIEMPRE (20-40s) =====
     await asyncio.sleep(random.randint(20, 40))
@@ -232,38 +241,38 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         cut = reply.rfind(" ", 0, 65)
         if cut == -1:
             cut = 65
-
         part1 = reply[:cut].strip()
         part2 = reply[cut:].strip()
 
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=part1,
-            api_kwargs=api_kwargs,
+            **api_kwargs,
         )
-
         await asyncio.sleep(random.randint(4, 18))
 
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=part2,
-            api_kwargs=api_kwargs,
+            **api_kwargs,
         )
     else:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=reply,
-            api_kwargs=api_kwargs,
+            **api_kwargs,
         )
 
 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     webhook_path = "/telegram/webhook"
     webhook_url = f"{PUBLIC_URL}{webhook_path}"
-    log.info(f"Webhook URL: {webhook_url}")
+
+    logger.info(f"Webhook URL: {webhook_url}")
 
     app.run_webhook(
         listen="0.0.0.0",
