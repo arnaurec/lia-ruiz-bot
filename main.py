@@ -28,19 +28,28 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 # Memoria en RAM (se pierde si redeploy). Luego la hacemos persistente si quieres.
 memory: Dict[str, Deque[Dict[str, str]]] = {}
 
+BLOCKED_PHRASES = [
+    "lo siento",
+    "no puedo",
+    "no puedo ayudarte",
+    "no puedo ayudar",
+    "no puedo hacer",
+    "no puedo continuar",
+    "no puedo seguir",
+    "como ia",
+]
+
 
 def conv_id_and_topic(update: Update) -> Tuple[str, int | None]:
     msg = update.effective_message
     chat = update.effective_chat
     dm_topic_id = None
-
     # Direct messages de canal → viene como "direct_messages_topic"
     if msg and getattr(msg, "direct_messages_topic", None):
         dm_topic_id = msg.direct_messages_topic.topic_id
         conv_id = f"dm:{chat.id}:{dm_topic_id}"
     else:
         conv_id = f"chat:{chat.id}"
-
     return conv_id, dm_topic_id
 
 
@@ -49,7 +58,7 @@ def append_history(conv_id: str, role: str, content: str) -> None:
     dq.append({"role": role, "content": content})
 
 
-def get_history(conv_id: str, limit: int = 16) -> list[dict]:
+def get_history(conv_id: str, limit: int = 16) -> list[Dict[str, str]]:
     dq = memory.get(conv_id)
     if not dq:
         return []
@@ -157,11 +166,10 @@ def classify(text: str) -> Dict[str, Any]:
     return json.loads(resp.choices[0].message.content)
 
 
-def generate_reply(history: list[dict], user_text: str) -> str:
+def generate_reply(history: list[Dict[str, str]], user_text: str) -> str:
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     msgs.extend(history[-12:])
     msgs.append({"role": "user", "content": user_text})
-
     resp = client.chat.completions.create(
         model="gpt-4o",
         temperature=0.9,
@@ -195,11 +203,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     flags = classify(user_text)
 
     # Responder en el topic correcto (si aplica)
-    api_kwargs = {}
-    if dm_topic_id is not None:
-        api_kwargs["direct_messages_topic_id"] = dm_topic_id
+    api_kwargs = (
+        {"direct_messages_topic_id": dm_topic_id}
+        if dm_topic_id is not None
+        else {}
+    )
 
-    # Menor → silencio total (no responder)
+    # Menor -> silencio total (no responder)
     if flags.get("possible_minor") is True:
         await alert_owner(context, f"🛑 Posible menor (claro). Se corta sin responder. Texto: {user_text}")
         return
@@ -212,36 +222,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if flags.get("complicated"):
         await alert_owner(context, f"🧠 Complicado. Texto: {user_text}")
 
-    # limpiar historial si se contamino con respuestas tipo "no puedo ayudarte"
-    if conv_id in memory:
-        memory[conv_id] = deque(
-            [m for m in memory[conv_id] if "no puedo" not in m["content"].lower()],
-            maxlen=60
-        )
-
     history = get_history(conv_id)
     reply = generate_reply(history, user_text)
 
-    blocked_phrases = [
-        "lo siento",
-        "no puedo",
-        "no puedo ayudarte",
-        "no puedo ayudar",
-        "no puedo hacer",
-        "no puedo continuar",
-        "no puedo seguir",
-        "como ia",
-    ]
-
     # Si el modelo suelta una respuesta "de rechazo", NO la envies y NO la guardes.
-    if reply and any(p in reply.lower() for p in blocked_phrases):
+    if reply and any(p in reply.lower() for p in BLOCKED_PHRASES):
         # opcional: limpiar su memoria para que no se quede "raro"
         memory.pop(conv_id, None)
         return
 
-    # evitar guardar respuestas tipo IA en memoria
-    if reply and not any(p in reply.lower() for p in blocked_phrases):
-        append_history(conv_id, "assistant", reply)
+    # Guardamos la respuesta (ya sabemos que es buena)
+    append_history(conv_id, "assistant", reply)
 
     # ===== DELAY FIJO SIEMPRE (20-40s) =====
     await asyncio.sleep(random.randint(20, 40))
@@ -276,12 +267,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     webhook_path = "/telegram/webhook"
     webhook_url = f"{PUBLIC_URL}{webhook_path}"
-
     logger.info(f"Webhook URL: {webhook_url}")
 
     app.run_webhook(
