@@ -144,7 +144,7 @@ CLASSIFIER_PROMPT = (
     "\"possible_minor\": boolean,\n"
     "\"asks_photo\": boolean,\n"
     "\"high_value\": boolean,\n"
-    "\"complicated\": boolean\"\n"
+    "\"complicated\": boolean\n"   # ← comilla extra eliminada aquí
     "}\n\n"
     "possible_minor SOLO si el usuario indica claramente edad <18 (ej: 'tengo 16', 'soy menor').\n"
     "asks_photo true si pide foto, nude, contenido personalizado, video, llamada, etc.\n"
