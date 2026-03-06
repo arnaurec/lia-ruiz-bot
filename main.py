@@ -222,12 +222,21 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reply = generate_reply(history, user_text)
 
     blocked_phrases = [
-        "lo siento",
-        "no puedo ayudarte",
-        "no puedo ayudar",
-        "no puedo hacer eso",
-        "como ia",
-    ]
+         "lo siento",
+         "no puedo",
+         "no puedo ayudarte",
+         "no puedo ayudar",
+         "no puedo hacer",
+         "no puedo continuar",
+         "no puedo seguir",
+         "como ia",
+     ]
+
+     # Si el modelo suelta una respuesta "de rechazo", NO la envies y NO la guardes.
+     if reply and any(p in reply.lower() for p in blocked_phrases):
+         # opcional: limpiar su memoria para que no se quede "raro"
+         memory.pop(conv_id, None)
+         return
 
     # evitar guardar respuestas tipo IA en memoria
     if reply and not any(p in reply.lower() for p in blocked_phrases):
