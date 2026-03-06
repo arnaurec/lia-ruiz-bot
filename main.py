@@ -16,7 +16,7 @@ logger = logging.getLogger("lia-bot")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PUBLIC_URL = os.getenv("PUBLIC_URL")   # Ej: https://xxxx.up.railway.app
+PUBLIC_URL = os.getenv("PUBLIC_URL")  # Ej: https://xxxx.up.railway.app
 PORT = int(os.getenv("PORT", "8080"))
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")  # usado más adelante
 
@@ -128,6 +128,7 @@ SYSTEM_PROMPT = (
     "- Evitar frases formales o roboticas.\n"
 )
 
+
 CLASSIFIER_PROMPT = (
     "Devuelve SOLO JSON valido con estas claves:\n"
     "{\n"
@@ -211,32 +212,32 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if flags.get("complicated"):
         await alert_owner(context, f"🧠 Complicado. Texto: {user_text}")
 
-
     # limpiar historial si se contamino con respuestas tipo "no puedo ayudarte"
     if conv_id in memory:
         memory[conv_id] = deque(
             [m for m in memory[conv_id] if "no puedo" not in m["content"].lower()],
             maxlen=60
-    )
+        )
+
     history = get_history(conv_id)
     reply = generate_reply(history, user_text)
 
     blocked_phrases = [
-         "lo siento",
-         "no puedo",
-         "no puedo ayudarte",
-         "no puedo ayudar",
-         "no puedo hacer",
-         "no puedo continuar",
-         "no puedo seguir",
-         "como ia",
-     ]
+        "lo siento",
+        "no puedo",
+        "no puedo ayudarte",
+        "no puedo ayudar",
+        "no puedo hacer",
+        "no puedo continuar",
+        "no puedo seguir",
+        "como ia",
+    ]
 
-     # Si el modelo suelta una respuesta "de rechazo", NO la envies y NO la guardes.
-     if reply and any(p in reply.lower() for p in blocked_phrases):
-         # opcional: limpiar su memoria para que no se quede "raro"
-         memory.pop(conv_id, None)
-         return
+    # Si el modelo suelta una respuesta "de rechazo", NO la envies y NO la guardes.
+    if reply and any(p in reply.lower() for p in blocked_phrases):
+        # opcional: limpiar su memoria para que no se quede "raro"
+        memory.pop(conv_id, None)
+        return
 
     # evitar guardar respuestas tipo IA en memoria
     if reply and not any(p in reply.lower() for p in blocked_phrases):
