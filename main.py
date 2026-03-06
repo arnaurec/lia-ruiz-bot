@@ -210,8 +210,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await alert_owner(context, f"🧠 Complicado. Texto: {user_text}")
 
     history = get_history(conv_id)
-    reply = generate_reply(history, user_text)
+reply = generate_reply(history, user_text)
 
+blocked_phrases = [
+    "lo siento",
+    "no puedo ayudarte",
+    "no puedo hacer eso",
+    "como ia"
+]
+
+if not any(p in reply.lower() for p in blocked_phrases):
     append_history(conv_id, "assistant", reply)
 
     # ===== DELAY FIJO SIEMPRE (20-40s) =====
