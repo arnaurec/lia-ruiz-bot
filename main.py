@@ -3,31 +3,56 @@ import json
 import logging
 import os
 import random
+import hashlib
+import hmac
 from collections import deque
-from typing import Any, Deque, Dict, Tuple
+from typing import Any, Deque, Dict, Tuple, Optional
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, APIError
 from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandler, filters
+import aiohttp
 
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("lia-bot")
 
+# Environment Variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-PUBLIC_URL = os.getenv("PUBLIC_URL")  # Ej: https://xxxx.up.railway.app
+PUBLIC_URL = os.getenv("PUBLIC_URL")
 PORT = int(os.getenv("PORT", "8080"))
-OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")  # usado más adelante
+OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # Para validar webhooks
+REDIS_URL = os.getenv("REDIS_URL")  # Opcional: para persistencia
 
 if not all([BOT_TOKEN, OPENAI_API_KEY, PUBLIC_URL]):
     raise RuntimeError("Faltan env vars: BOT_TOKEN, OPENAI_API_KEY, PUBLIC_URL")
 
+# Inicialización cliente OpenAI
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# Memoria en RAM (se pierde si redeploy). Luego la hacemos persistente si quieres.
+# Memory setup (Redis si está disponible, si no RAM)
 memory: Dict[str, Deque[Dict[str, str]]] = {}
+redis_client = None
 
+if REDIS_URL:
+    try:
+        import redis.asyncio as redis
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        logger.info("Redis conectado para persistencia")
+    except Exception as e:
+        logger.warning(f"No se pudo conectar Redis: {e}. Usando memoria RAM.")
+
+
+# Constantes
+MAX_HISTORY_PER_USER = 60
+HISTORY_LIMIT_FOR_CONTEXT = 16
+OPENAI_HISTORY_LIMIT = 12
+MAX_MESSAGE_LENGTH = 2000  # Límite de caracteres para entrada de usuario
 BLOCKED_PHRASES = [
     "lo siento",
     "no puedo",
@@ -37,34 +62,96 @@ BLOCKED_PHRASES = [
     "no puedo continuar",
     "no puedo seguir",
     "como ia",
+    "como inteligencia artificial",
+    "soy un asistente",
+    "soy una ia",
+    "no tengo sentimientos",
+    "no tengo cuerpo",
+    "no puedo enviar fotos",
+    "no tengo edad",
+    "no soy real",
 ]
 
+# Rate limiting simple (en producción usa Redis)
+user_last_message: Dict[str, float] = {}
+RATE_LIMIT_SECONDS = 1  # Mínimo tiempo entre mensajes del mismo usuario
 
-def conv_id_and_topic(update: Update) -> Tuple[str, int | None]:
+
+def conv_id_and_topic(update: Update) -> Tuple[str, Optional[int]]:
+    """Extrae conversation ID y topic ID si es un DM de canal."""
     msg = update.effective_message
     chat = update.effective_chat
+    
+    if not msg or not chat:
+        return "unknown", None
+    
     dm_topic_id = None
-    # Direct messages de canal → viene como "direct_messages_topic"
-    if msg and getattr(msg, "direct_messages_topic", None):
-        dm_topic_id = msg.direct_messages_topic.topic_id
+    
+    # Direct messages de canal
+    if getattr(msg, "is_topic_message", False) and getattr(msg, "message_thread_id", None):
+        dm_topic_id = msg.message_thread_id
         conv_id = f"dm:{chat.id}:{dm_topic_id}"
     else:
         conv_id = f"chat:{chat.id}"
+    
     return conv_id, dm_topic_id
 
 
-def append_history(conv_id: str, role: str, content: str) -> None:
-    dq = memory.setdefault(conv_id, deque(maxlen=60))
+async def get_memory(conv_id: str) -> Deque[Dict[str, str]]:
+    """Obtiene historial desde Redis o memoria local."""
+    if redis_client:
+        try:
+            data = await redis_client.get(f"memory:{conv_id}")
+            if data:
+                parsed = json.loads(data)
+                dq = deque(maxlen=MAX_HISTORY_PER_USER)
+                dq.extend(parsed)
+                return dq
+        except Exception as e:
+            logger.error(f"Error leyendo Redis: {e}")
+    
+    return memory.setdefault(conv_id, deque(maxlen=MAX_HISTORY_PER_USER))
+
+
+async def save_memory(conv_id: str, dq: Deque[Dict[str, str]]) -> None:
+    """Guarda historial en Redis o memoria local."""
+    if redis_client:
+        try:
+            await redis_client.setex(
+                f"memory:{conv_id}",
+                86400 * 7,  # TTL: 7 días
+                json.dumps(list(dq))
+            )
+        except Exception as e:
+            logger.error(f"Error guardando en Redis: {e}")
+    else:
+        memory[conv_id] = dq
+
+
+async def append_history(conv_id: str, role: str, content: str) -> None:
+    """Añade mensaje al historial."""
+    dq = await get_memory(conv_id)
     dq.append({"role": role, "content": content})
+    await save_memory(conv_id, dq)
 
 
-def get_history(conv_id: str, limit: int = 16) -> list[Dict[str, str]]:
-    dq = memory.get(conv_id)
-    if not dq:
-        return []
+async def get_history(conv_id: str, limit: int = HISTORY_LIMIT_FOR_CONTEXT) -> list[Dict[str, str]]:
+    """Obtiene últimos mensajes del historial."""
+    dq = await get_memory(conv_id)
     return list(dq)[-limit:]
 
 
+async def clear_history(conv_id: str) -> None:
+    """Limpia historial de una conversación."""
+    if redis_client:
+        try:
+            await redis_client.delete(f"memory:{conv_id}")
+        except Exception as e:
+            logger.error(f"Error borrando de Redis: {e}")
+    memory.pop(conv_id, None)
+
+
+# Prompts
 SYSTEM_PROMPT = (
     "Eres Lia Ruiz, 23 anos, espanola, Gen Z.\n"
     "Hablas por telegram de forma muy humana, provocadora, picara y sexualmente intensa.\n\n"
@@ -144,141 +231,264 @@ CLASSIFIER_PROMPT = (
     "\"possible_minor\": boolean,\n"
     "\"asks_photo\": boolean,\n"
     "\"high_value\": boolean,\n"
-    "\"complicated\": boolean\n"   # ← comilla extra eliminada aquí
+    "\"complicated\": boolean\n"
     "}\n\n"
-    "possible_minor SOLO si el usuario indica claramente edad <18 (ej: 'tengo 16', 'soy menor').\n"
+    "possible_minor SOLO si el usuario indica claramente edad <18 (ej: 'tengo 16', 'soy menor', '17 años').\n"
     "asks_photo true si pide foto, nude, contenido personalizado, video, llamada, etc.\n"
     "high_value true si parece que va a gastar mucho o insiste mucho.\n"
     "complicated true si pide algo raro/tecnico/largo que no sea flirteo simple.\n"
 )
 
 
+def check_rate_limit(user_id: str) -> bool:
+    """Verifica si el usuario está dentro del rate limit."""
+    import time
+    now = time.time()
+    last = user_last_message.get(user_id, 0)
+    
+    if now - last < RATE_LIMIT_SECONDS:
+        return False
+    
+    user_last_message[user_id] = now
+    return True
+
+
 def classify(text: str) -> Dict[str, Any]:
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        temperature=0,
-        messages=[
-            {"role": "system", "content": CLASSIFIER_PROMPT},
-            {"role": "user", "content": text},
-        ],
-        response_format={"type": "json_object"},
-    )
-    return json.loads(resp.choices[0].message.content)
+    """Clasifica el mensaje del usuario."""
+    # Truncar si es muy largo para ahorrar tokens
+    truncated = text[:500] if len(text) > 500 else text
+    
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": CLASSIFIER_PROMPT},
+                {"role": "user", "content": truncated},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=150,
+        )
+        content = resp.choices[0].message.content
+        if not content:
+            return {"possible_minor": False, "asks_photo": False, "high_value": False, "complicated": False}
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        logger.error(f"Error parseando JSON del clasificador: {e}")
+        return {"possible_minor": False, "asks_photo": False, "high_value": False, "complicated": False}
+    except Exception as e:
+        logger.error(f"Error en clasificación: {e}")
+        return {"possible_minor": False, "asks_photo": False, "high_value": False, "complicated": False}
 
 
-def generate_reply(history: list[Dict[str, str]], user_text: str) -> str:
+def generate_reply(history: list[Dict[str, str]], user_text: str) -> Optional[str]:
+    """Genera respuesta usando OpenAI."""
+    # Truncar mensaje de usuario si es muy largo
+    truncated_user = user_text[:MAX_MESSAGE_LENGTH] if len(user_text) > MAX_MESSAGE_LENGTH else user_text
+    
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-    msgs.extend(history[-12:])
-    msgs.append({"role": "user", "content": user_text})
-    resp = client.chat.completions.create(
-        model="gpt-4o",
-        temperature=0.9,
-        messages=msgs,
-    )
-    return resp.choices[0].message.content.strip()
+    msgs.extend(history[-OPENAI_HISTORY_LIMIT:])
+    msgs.append({"role": "user", "content": truncated_user})
+    
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            temperature=0.9,
+            messages=msgs,
+            max_tokens=500,  # Limitar longitud de respuesta
+        )
+        return resp.choices[0].message.content.strip()
+    except RateLimitError:
+        logger.error("Rate limit de OpenAI alcanzado")
+        return None
+    except APIError as e:
+        logger.error(f"Error API OpenAI: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error generando respuesta: {e}")
+        return None
 
 
 async def alert_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    """Envía alerta al propietario del bot."""
     if not OWNER_CHAT_ID:
         return
     try:
+        # Truncar mensaje si es muy largo
+        safe_text = text[:3800] + "..." if len(text) > 3800 else text
         await context.bot.send_message(
             chat_id=int(OWNER_CHAT_ID),
-            text=text,
+            text=safe_text[:4000],  # Límite de Telegram
+            disable_notification=True,
         )
     except Exception as e:
         logger.warning(f"Alerta owner fallo: {e}")
 
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler para comando /start."""
+    welcome_text = (
+        "hey 😏\n"
+        "soy Lia. aqui estoy para lo que necesites...\n"
+        "escríbeme cuando quieras jugar 🔥"
+    )
+    await update.message.reply_text(welcome_text)
+
+
+async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler para comando /clear - limpia historial."""
+    conv_id, _ = conv_id_and_topic(update)
+    await clear_history(conv_id)
+    await update.message.reply_text("memoria borrada... empezamos de cero 😈")
+
+
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handler principal para mensajes de texto."""
     msg = update.effective_message
     if not msg or not msg.text:
         return
 
     user_text = msg.text.strip()
+    
+    # Validar longitud mínima
+    if not user_text:
+        return
+    
+    # Rate limiting
+    user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+    if not check_rate_limit(user_id):
+        logger.info(f"Rate limit aplicado a usuario {user_id}")
+        return
+
     conv_id, dm_topic_id = conv_id_and_topic(update)
+    
+    # Guardar en historial
+    await append_history(conv_id, "user", user_text)
 
-    append_history(conv_id, "user", user_text)
-
+    # Clasificar mensaje
     flags = classify(user_text)
 
-    # Responder en el topic correcto (si aplica)
-    api_kwargs = (
-        {"direct_messages_topic_id": dm_topic_id}
-        if dm_topic_id is not None
-        else {}
-    )
+    # Preparar kwargs para envío (topic si aplica)
+    api_kwargs = {}
+    if dm_topic_id is not None:
+        api_kwargs["message_thread_id"] = dm_topic_id
 
-    # Menor -> silencio total (no responder)
+    # Detección de menor - SILENCIO TOTAL
     if flags.get("possible_minor") is True:
-        await alert_owner(context, f"🛑 Posible menor (claro). Se corta sin responder. Texto: {user_text}")
+        await alert_owner(context, f"🛑 Posible menor detectado. Conv: {conv_id}\nTexto: {user_text[:200]}")
+        # No respondemos nada
         return
 
-    # Alertas internas
+    # Alertas para el owner
     if flags.get("asks_photo"):
-        await alert_owner(context, f"📸 Piden foto/personalizado. Texto: {user_text}")
+        await alert_owner(context, f"📸 Piden foto/personalizado. Conv: {conv_id}\nTexto: {user_text[:200]}")
     if flags.get("high_value"):
-        await alert_owner(context, f"🔥 Alto valor. Texto: {user_text}")
+        await alert_owner(context, f"🔥 Alto valor. Conv: {conv_id}\nTexto: {user_text[:200]}")
     if flags.get("complicated"):
-        await alert_owner(context, f"🧠 Complicado. Texto: {user_text}")
+        await alert_owner(context, f"🧠 Complicado. Conv: {conv_id}\nTexto: {user_text[:200]}")
 
-    history = get_history(conv_id)
+    # Obtener historial y generar respuesta
+    history = await get_history(conv_id)
     reply = generate_reply(history, user_text)
 
-    # Si el modelo suelta una respuesta "de rechazo", NO la envies y NO la guardes.
-    if reply and any(p in reply.lower() for p in BLOCKED_PHRASES):
-        # opcional: limpiar su memoria para que no se quede "raro"
-        memory.pop(conv_id, None)
+    # Si falló la generación o es None, no respondemos
+    if not reply:
+        logger.error("No se pudo generar respuesta")
         return
 
-    # Guardamos la respuesta (ya sabemos que es buena)
-    append_history(conv_id, "assistant", reply)
+    # Verificar frases bloqueadas (rechazo del modelo)
+    reply_lower = reply.lower()
+    if any(phrase in reply_lower for phrase in BLOCKED_PHRASES):
+        logger.warning(f"Respuesta bloqueada detectada: {reply[:100]}...")
+        # Limpiar historial para resetear contexto
+        await clear_history(conv_id)
+        # Opcional: enviar mensaje genérico o simplemente no responder
+        return
 
-    # ===== DELAY FIJO SIEMPRE (20-40s) =====
+    # Guardar respuesta en historial
+    await append_history(conv_id, "assistant", reply)
+
+    # Delay aleatorio para parecer humano (20-40s)
     await asyncio.sleep(random.randint(20, 40))
 
-    # ===== ENVIO MENSAJE (a veces en 2 partes para parecer humano) =====
-    if random.random() < 0.35 and len(reply) > 90:
-        cut = reply.rfind(" ", 0, 65)
-        if cut == -1:
-            cut = 65
-        part1 = reply[:cut].strip()
-        part2 = reply[cut:].strip()
+    # Enviar respuesta (a veces dividida en 2 partes)
+    try:
+        if random.random() < 0.35 and len(reply) > 90:
+            # Dividir en dos mensajes
+            cut = reply.rfind(" ", 0, 65)
+            if cut == -1:
+                cut = 65
+            
+            part1 = reply[:cut].strip()
+            part2 = reply[cut:].strip()
 
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=part1,
-            **api_kwargs,
-        )
-        await asyncio.sleep(random.randint(4, 18))
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=part1,
+                **api_kwargs,
+            )
+            
+            # Delay entre mensajes
+            await asyncio.sleep(random.randint(4, 18))
+            
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=part2,
+                **api_kwargs,
+            )
+        else:
+            # Mensaje único
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=reply,
+                **api_kwargs,
+            )
+            
+    except Exception as e:
+        logger.error(f"Error enviando mensaje: {e}")
 
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=part2,
-            **api_kwargs,
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=reply,
-            **api_kwargs,
-        )
+
+async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manejador de errores global."""
+    logger.error(f"Error en el bot: {context.error}", exc_info=True)
+    
+    # Notificar al owner de errores graves
+    if OWNER_CHAT_ID and context.error:
+        try:
+            error_msg = f"⚠️ Error en bot: {str(context.error)[:500]}"
+            await context.bot.send_message(chat_id=int(OWNER_CHAT_ID), text=error_msg)
+        except:
+            pass
 
 
 def main() -> None:
+    """Función principal."""
+    # Crear aplicación
     app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Añadir handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-
+    
+    # Añadir manejador de errores
+    app.add_error_handler(error_handler)
+    
+    # Configurar webhook
     webhook_path = "/telegram/webhook"
     webhook_url = f"{PUBLIC_URL}{webhook_path}"
+    
+    logger.info(f"Iniciando bot...")
     logger.info(f"Webhook URL: {webhook_url}")
-
+    logger.info(f"Puerto: {PORT}")
+    
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=webhook_path.strip("/"),
         webhook_url=webhook_url,
         allowed_updates=Update.ALL_TYPES,
+        secret_token=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
     )
 
 
