@@ -7,10 +7,9 @@ import time
 import re
 from collections import deque
 from typing import Any, Deque, Dict, Tuple, Optional, List
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, APIError
 from telegram import Update
 from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandler, filters
-from telegram.error import BadRequest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,6 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lia-bot")
 
+# Environment Variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PUBLIC_URL = os.getenv("PUBLIC_URL")
@@ -31,31 +31,35 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 
 memory: Dict[str, Deque[Dict[str, str]]] = {}
 user_last_message: Dict[str, float] = {}
-user_message_count: Dict[str, int] = {}
+user_message_count: Dict[str, int] = {} # Para tracking de "confianza"
 
-MAX_HISTORY_PER_USER = 80
-OPENAI_HISTORY_LIMIT = 20
+# Constantes
+MAX_HISTORY_PER_USER = 80 # Más memoria para contexto largo
+OPENAI_HISTORY_LIMIT = 20 # Más contexto para coherencia
 MAX_MESSAGE_LENGTH = 1500
 RATE_LIMIT_SECONDS = 0.5
 
+# ===== TÉCNICAS DE HUMANIZACIÓN =====
+# 1. ERRORES TIPOGÁFICOS NATURALES (se aplican post-generación)
 TYPO_PATTERNS = [
-    (r'\bque\b', 'q', 0.15),
+    (r'\bque\b', 'q', 0.15), # 15% de probabilidad
     (r'\bporque\b', 'pq', 0.12),
     (r'\bpor qué\b', 'xq', 0.10),
     (r'\btambién\b', 'tmb', 0.08),
-    (r'\bpero\b', 'pero', 0.05),
-    (r'\bnada\b', 'nadaa', 0.06),
+    (r'\bpero\b', 'pero', 0.05), # A veces sin espacio antes
+    (r'\bnada\b', 'nadaa', 0.06), # Alargar vocales
     (r'\bsí\b', 'sii', 0.08),
     (r'\bno\b', 'noo', 0.06),
     (r'\bvale\b', 'vaale', 0.05),
     (r'\bclaro\b', 'claroo', 0.05),
-    (r',', '', 0.03),
-    (r'\.', '', 0.02),
-    (r'\?', '', 0.05),
-    (r'¡', '', 0.30),
-    (r'!', '', 0.10),
+    (r',', '', 0.03), # Omitir comas aleatoriamente
+    (r'\.', '', 0.02), # Omitir puntos finales a veces
+    (r'\?', '', 0.05), # A veces sin signo de interrogación
+    (r'¡', '', 0.30), # Quitar exclamaciones abiertas (poco usadas en chat)
+    (r'!', '', 0.10), # A veces sin exclamación
 ]
 
+# 2. ABREVIATURAS Y JERGA GEN Z ESPAÑOLA
 SLANG_REPLACEMENTS = {
     'muy': ['mu', 'super', 're'],
     'mucho': ['muucho', 'un montón', 'cantidad'],
@@ -69,21 +73,25 @@ SLANG_REPLACEMENTS = {
     'móvil': ['móvil', 'tlf', 'teléfono'],
 }
 
+# 3. EXPRESIONES DE RELLENO NATURALES (como cuando alguien piensa)
 FILLER_WORDS = [
     'eeeh', 'mmm', 'bueno', 'pues', 'oye', 'a ver', 'total',
     'es que', 'o sea', 'vamos', 'digamos', 'al final', 'en plan',
     'tipo', 'como', 'y tal', 'y eso', 'y ya', 'pues eso',
 ]
 
+# 4. RESPUESTAS DE "ESTÁ ESCRIBIENDO" SIMULADAS
 TYPING_DELAYS = {
-    'short': (1, 3),
-    'medium': (3, 8),
-    'long': (8, 15),
-    'sexy': (4, 12),
+    'short': (1, 3), # Mensaje corto
+    'medium': (3, 8), # Mensaje medio
+    'long': (8, 15), # Mensaje largo o "pensando"
+    'sexy': (4, 12), # Cuando el tema es hot (se "excita" escribiendo)
 }
 
-INCONSISTENCY_CHANCE = 0.08
+# 5. INCONSISTENCIAS HUMANAS PROGRAMADAS
+INCONSISTENCY_CHANCE = 0.08 # 8% de "errores" humanos
 
+# 6. ESTADOS DE ÁNIMO SIMULADOS (cambia según hora/contexto)
 MOOD_VARIANTS = {
     'morning': ['muerta de sueño', 'café primero', 'ñaa'],
     'afternoon': ['normal', 'activa', 'con hambre'],
@@ -91,6 +99,7 @@ MOOD_VARIANTS = {
     'late_night': ['cansada pero horny', 'sin filtro', 'directa'],
 }
 
+# Prompt ultra-humanizado
 SYSTEM_PROMPT = """Eres COMPLETAMENTE HUMANA. Te llamas Lia Ruiz, tienes 23 años, vives en Madrid, España.
 TU VIDA REAL (memoriza esto, eres ESTA persona):
 - Estudias diseño de moda pero te aburre, vas a clase cuando quieres
@@ -171,6 +180,7 @@ Responde: OK o MAL"""
 def get_current_mood() -> str:
     from datetime import datetime
     hour = datetime.now().hour
+   
     if 6 <= hour < 12:
         return random.choice(MOOD_VARIANTS['morning'])
     elif 12 <= hour < 18:
@@ -182,6 +192,7 @@ def get_current_mood() -> str:
 
 def apply_typos_and_slang(text: str) -> str:
     result = text
+   
     for pattern, replacement, probability in TYPO_PATTERNS:
         if random.random() < probability:
             matches = list(re.finditer(pattern, result, re.IGNORECASE))
@@ -194,20 +205,30 @@ def apply_typos_and_slang(text: str) -> str:
                         result = result[:start] + replacement_upper + result[end:]
                     else:
                         result = result[:start] + replacement + result[end:]
+   
     if random.random() < 0.25 and not result.startswith(('jaja', 'mmm', 'eeeh')):
         filler = random.choice(FILLER_WORDS)
         result = f"{filler} {result}"
+   
     emotion_words = ['no', 'sí', 'si', 'vale', 'bueno', 'guay', 'uff', 'ay', 'oh']
     for word in emotion_words:
         pattern = rf'\b{word}\b'
         if re.search(pattern, result, re.IGNORECASE) and random.random() < 0.3:
             extra = word[-1] * random.randint(1, 2)
             result = re.sub(pattern, word + extra, result, flags=re.IGNORECASE, count=1)
+   
     if random.random() < INCONSISTENCY_CHANCE:
-        corrections = [" wait no", " bueno no", " es broma", " bueno sí", " o sea"]
+        corrections = [
+            " wait no",
+            " bueno no",
+            " es broma",
+            " bueno sí",
+            " o sea",
+        ]
         result += random.choice(corrections)
         if random.random() < 0.5:
             result += "..."
+   
     return result
 
 def humanize_message_structure(text: str, is_hot_context: bool = False) -> Tuple[str, Optional[str]]:
@@ -222,20 +243,25 @@ def humanize_message_structure(text: str, is_hot_context: bool = False) -> Tuple
                 current = ""
         if current:
             full_sentences.append(current.strip())
+       
         mid = len(full_sentences) // 2
         part1 = ' '.join(full_sentences[:mid])
         part2 = ' '.join(full_sentences[mid:])
+       
         return part1, part2
+   
     return text, None
 
 def calculate_typing_delay(text: str, is_hot: bool = False) -> float:
     base = len(text) * 0.08
+   
     if is_hot:
         base *= random.uniform(0.6, 0.9)
         if random.random() < 0.3:
             base += random.uniform(3, 6)
     else:
         base *= random.uniform(0.8, 1.4)
+   
     return min(max(base, 1.5), 25)
 
 def conv_id_and_topic(update: Update) -> Tuple[str, Optional[int]]:
@@ -243,12 +269,14 @@ def conv_id_and_topic(update: Update) -> Tuple[str, Optional[int]]:
     chat = update.effective_chat
     if not msg or not chat:
         return "unknown", None
-    thread_id = msg.message_thread_id
-    if thread_id is not None:
-        conv_id = f"dm:{chat.id}:{thread_id}"
+   
+    dm_topic_id = None
+    if msg.is_topic_message and msg.message_thread_id:
+        dm_topic_id = msg.message_thread_id
+        conv_id = f"dm:{chat.id}:{dm_topic_id}"
     else:
         conv_id = f"chat:{chat.id}"
-    return conv_id, thread_id
+    return conv_id, dm_topic_id
 
 def get_memory(conv_id: str) -> Deque[Dict[str, str]]:
     if conv_id not in memory:
@@ -294,36 +322,48 @@ def classify(text: str) -> Dict[str, Any]:
 
 def validate_human_tone(reply: str) -> Tuple[bool, str]:
     problems = []
+   
     sentences = reply.split('. ')
     capitalized = sum(1 for s in sentences if s and s[0].isupper())
     if len(sentences) > 2 and capitalized / len(sentences) > 0.8:
         problems.append("demasiado formal (mayúsculas)")
+   
     if reply.count(',') > 3 and reply.count('.') > 2:
         if len(reply) / (reply.count(',') + reply.count('.')) < 15:
             problems.append("puntuación excesiva")
+   
     abbr_count = sum(1 for abbr in ['q ', 'xq', 'tmb', 'jaja', '...'] if abbr in reply.lower())
     if abbr_count == 0 and len(reply) > 30:
         problems.append("sin abreviaturas ni errores")
+   
     if len(reply) > 150 and '\n' not in reply and reply.count('. ') > 3:
         problems.append("párrafo largo y estructurado")
+   
     formal_words = ['sin embargo', 'por lo tanto', 'en consecuencia', 'además', 'asimismo']
     if any(w in reply.lower() for w in formal_words):
         problems.append("lenguaje formal")
+   
     ia_phrases = ['como', 'siendo', 'al ser', 'mi función', 'mi propósito']
     if any(p in reply.lower() for p in ia_phrases):
         problems.append("lenguaje de IA")
+   
     if problems:
         return False, ", ".join(problems)
     return True, "ok"
 
 def generate_raw_reply(history: list, user_text: str, user_id: str) -> Optional[str]:
     msg_count = user_message_count.get(user_id, 0)
+   
     intimacy_level = "nuevo" if msg_count < 3 else "conociendo" if msg_count < 10 else "confianza"
+   
     mood = get_current_mood()
+   
     enhanced_system = SYSTEM_PROMPT + f"\n\nCONTEXTO AHORA: Estás {mood}. Este usuario lleva {msg_count} mensajes contigo ({intimacy_level})."
+   
     msgs = [{"role": "system", "content": enhanced_system}]
     msgs.extend(history[-OPENAI_HISTORY_LIMIT:])
     msgs.append({"role": "user", "content": user_text[:MAX_MESSAGE_LENGTH]})
+   
     try:
         resp = client.chat.completions.create(
             model="gpt-4o",
@@ -340,9 +380,13 @@ def generate_raw_reply(history: list, user_text: str, user_id: str) -> Optional[
 def process_reply_to_human(reply: str, is_hot: bool = False) -> Tuple[str, Optional[str], float]:
     if not reply:
         return random.choice(FALLBACK_RESPONSES), None, 2.0
+   
     humanized = apply_typos_and_slang(reply)
+   
     part1, part2 = humanize_message_structure(humanized, is_hot)
+   
     delay = calculate_typing_delay(part1, is_hot)
+   
     return part1, part2, delay
 
 FALLBACK_RESPONSES = [
@@ -395,31 +439,29 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_text = msg.text.strip()
     if not user_text:
         return
-
+   
     user_id = str(update.effective_user.id) if update.effective_user else "unknown"
     if not check_rate_limit(user_id):
         return
-
+   
     conv_id, dm_topic_id = conv_id_and_topic(update)
-    logger.info(f"Mensaje recibido - conv_id: {conv_id}, dm_topic_id: {dm_topic_id}, thread del msg: {msg.message_thread_id if msg else 'None'}, reply_to posible: {msg.message_id}")
     append_history(conv_id, "user", user_text)
-
+   
     flags = classify(user_text)
-
+   
     if flags.get("minor"):
         await alert_owner(context, f"🛑 Menor: {user_text[:100]}")
         return
-
-    # Solo usamos message_thread_id si existe y es válido
+   
     api_kwargs = {}
-    if dm_topic_id is not None and dm_topic_id > 0:
+    if dm_topic_id is not None:
         api_kwargs["message_thread_id"] = dm_topic_id
-
+   
     history = get_history(conv_id)
     raw_reply = generate_raw_reply(history, user_text, user_id)
-
+   
     is_valid, reason = validate_human_tone(raw_reply) if raw_reply else (False, "none")
-
+   
     if not is_valid:
         logger.warning(f"Tono no humano ({reason}): {raw_reply[:80]}...")
         await alert_owner(context, f"⚠️ Tono raro ({reason}): {raw_reply[:100]}")
@@ -427,114 +469,69 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         is_valid, reason = validate_human_tone(raw_reply) if raw_reply else (False, "none")
         if not is_valid:
             raw_reply = random.choice(FALLBACK_RESPONSES)
-
+   
     is_hot = flags.get("hot", False)
     part1, part2, typing_delay = process_reply_to_human(raw_reply, is_hot)
-
+   
     append_history(conv_id, "assistant", part1)
     if part2:
         append_history(conv_id, "assistant", part2)
-
-    try:
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id,
-            action="typing",
-            **api_kwargs
-        )
-    except BadRequest as e:
-        if "Chat actions can't be sent to channel direct messages chats" in str(e):
-            logger.info(f"Ignorando typing en topic canal: {conv_id}")
-        else:
-            logger.warning(f"Error typing: {e}")
-    except Exception as e:
-        logger.warning(f"Error inesperado typing: {e}")
-
+   
+    await context.bot.send_chat_action(
+        chat_id=update.effective_chat.id,
+        action="typing",
+        **api_kwargs
+    )
+   
     await asyncio.sleep(typing_delay)
-
-    # Envío principal: priorizar reply_to_message_id
-    send_kwargs = api_kwargs.copy()
-    if msg.message_id:
-        send_kwargs["reply_to_message_id"] = msg.message_id
-
+   
     try:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=part1,
-            **send_kwargs,
+            **api_kwargs,
         )
-
+       
         if part2:
-            try:
-                await context.bot.send_chat_action(
-                    chat_id=update.effective_chat.id,
-                    action="typing",
-                    **api_kwargs
-                )
-            except BadRequest:
-                pass
-
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id,
+                action="typing",
+                **api_kwargs
+            )
             await asyncio.sleep(random.uniform(2, 6))
-
+           
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=part2,
-                **send_kwargs,
+                **api_kwargs,
             )
-
-    except BadRequest as e:
-        error_str = str(e).lower()
-        if "channel direct messages topic must be specified" in error_str or "topic must be specified" in error_str:
-            logger.warning(f"Error 'topic must be specified' - intentando envío básico con solo reply_to: {conv_id}")
-            try:
-                basic_kwargs = {"reply_to_message_id": msg.message_id} if msg.message_id else {}
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=part1,
-                    **basic_kwargs
-                )
-                if part2:
-                    await asyncio.sleep(random.uniform(2, 6))
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=part2,
-                        **basic_kwargs
-                    )
-            except Exception as retry_e:
-                logger.error(f"Reintento básico falló: {retry_e}")
-                if OWNER_CHAT_ID:
-                    await alert_owner(context, f"Error crítico en topic {conv_id}: {str(retry_e)}\nUsuario: {user_id}\nTexto: {user_text[:200]}")
-        else:
-            logger.error(f"Error enviando: {e}")
-            if OWNER_CHAT_ID:
-                await alert_owner(context, f"Error enviando a {conv_id}: {str(e)}")
+           
     except Exception as e:
         logger.error(f"Error enviando: {e}")
-        if OWNER_CHAT_ID:
-            await alert_owner(context, f"Error general enviando: {str(e)}")
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Error global: {context.error}", exc_info=True)
+    logger.error(f"Error: {context.error}", exc_info=True)
     if OWNER_CHAT_ID and context.error:
         try:
             await context.bot.send_message(
                 chat_id=int(OWNER_CHAT_ID),
-                text=f"💥 Error global: {str(context.error)[:400]}"
+                text=f"💥 Error: {str(context.error)[:400]}"
             )
         except:
             pass
 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
-
+   
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("clear", clear_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(error_handler)
-
+   
     webhook_url = f"{PUBLIC_URL}/telegram/webhook"
-
+   
     logger.info(f"Bot iniciado en {webhook_url}")
-
+   
     app.run_webhook(
         listen="0.0.0.0",
         port=PORT,
