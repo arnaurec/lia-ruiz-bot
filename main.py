@@ -39,7 +39,6 @@ OPENAI_HISTORY_LIMIT = 20
 MAX_MESSAGE_LENGTH = 1500
 RATE_LIMIT_SECONDS = 0.5
 
-# ===== TÉCNICAS DE HUMANIZACIÓN =====
 TYPO_PATTERNS = [
     (r'\bque\b', 'q', 0.15),
     (r'\bporque\b', 'pq', 0.12),
@@ -245,12 +244,22 @@ def conv_id_and_topic(update: Update) -> Tuple[str, Optional[int]]:
     chat = update.effective_chat
     if not msg or not chat:
         return "unknown", None
-    thread_id = msg.message_thread_id
-    if thread_id is not None:
-        conv_id = f"dm:{chat.id}:{thread_id}"
+
+    dm_topic_id = None
+
+    # Prioridad al nuevo campo para channel direct messages
+    if getattr(msg, "direct_messages_topic", None):
+        dm_topic_id = msg.direct_messages_topic.topic_id
+        conv_id = f"dm:{chat.id}:{dm_topic_id}"
     else:
-        conv_id = f"chat:{chat.id}"
-    return conv_id, thread_id
+        # Fallback al viejo método
+        if msg.is_topic_message and msg.message_thread_id:
+            dm_topic_id = msg.message_thread_id
+            conv_id = f"dm:{chat.id}:{dm_topic_id}"
+        else:
+            conv_id = f"chat:{chat.id}"
+
+    return conv_id, dm_topic_id
 
 def get_memory(conv_id: str) -> Deque[Dict[str, str]]:
     if conv_id not in memory:
@@ -415,7 +424,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     api_kwargs = {}
     if dm_topic_id is not None:
-        api_kwargs["message_thread_id"] = dm_topic_id
+        api_kwargs["direct_messages_topic_id"] = dm_topic_id  # ← Cambio clave
 
     history = get_history(conv_id)
     raw_reply = generate_raw_reply(history, user_text, user_id)
@@ -454,7 +463,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await asyncio.sleep(typing_delay)
 
-    # Envío principal
+    # Envío principal con parámetro correcto
     send_kwargs = api_kwargs.copy()
     if msg.message_id:
         send_kwargs["reply_to_message_id"] = msg.message_id
