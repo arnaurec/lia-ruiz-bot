@@ -18,7 +18,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lia-bot")
 
-# Variables de entorno
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PUBLIC_URL = os.getenv("PUBLIC_URL")
@@ -402,7 +401,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     conv_id, dm_topic_id = conv_id_and_topic(update)
-    logger.info(f"Mensaje recibido - conv_id: {conv_id}, dm_topic_id: {dm_topic_id}, thread del msg: {msg.message_thread_id if msg else 'None'}")
+    logger.info(f"Mensaje recibido - conv_id: {conv_id}, dm_topic_id: {dm_topic_id}, thread del msg: {msg.message_thread_id if msg else 'None'}, reply_to posible: {msg.message_id}")
     append_history(conv_id, "user", user_text)
 
     flags = classify(user_text)
@@ -411,8 +410,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await alert_owner(context, f"🛑 Menor: {user_text[:100]}")
         return
 
+    # Solo usamos message_thread_id si existe y es válido
     api_kwargs = {}
-    if dm_topic_id is not None:
+    if dm_topic_id is not None and dm_topic_id > 0:
         api_kwargs["message_thread_id"] = dm_topic_id
 
     history = get_history(conv_id)
@@ -451,8 +451,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await asyncio.sleep(typing_delay)
 
+    # Envío principal: priorizar reply_to_message_id
     send_kwargs = api_kwargs.copy()
-    if dm_topic_id is not None and msg.message_id:
+    if msg.message_id:
         send_kwargs["reply_to_message_id"] = msg.message_id
 
     try:
@@ -483,39 +484,41 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except BadRequest as e:
         error_str = str(e).lower()
         if "channel direct messages topic must be specified" in error_str or "topic must be specified" in error_str:
-            logger.warning(f"Error topic must be specified - reintentando SOLO con reply_to: {conv_id}")
+            logger.warning(f"Error 'topic must be specified' - intentando envío básico con solo reply_to: {conv_id}")
             try:
+                basic_kwargs = {"reply_to_message_id": msg.message_id} if msg.message_id else {}
                 await context.bot.send_message(
                     chat_id=update.effective_chat.id,
                     text=part1,
-                    reply_to_message_id=msg.message_id if msg else None
+                    **basic_kwargs
                 )
                 if part2:
                     await asyncio.sleep(random.uniform(2, 6))
                     await context.bot.send_message(
                         chat_id=update.effective_chat.id,
                         text=part2,
-                        reply_to_message_id=msg.message_id if msg else None
+                        **basic_kwargs
                     )
             except Exception as retry_e:
-                logger.error(f"Reintento falló completamente: {retry_e}")
+                logger.error(f"Reintento básico falló: {retry_e}")
                 if OWNER_CHAT_ID:
-                    await context.bot.send_message(
-                        chat_id=int(OWNER_CHAT_ID),
-                        text=f"Error crítico en topic {conv_id}: {str(retry_e)}"
-                    )
+                    await alert_owner(context, f"Error crítico en topic {conv_id}: {str(retry_e)}\nUsuario: {user_id}\nTexto: {user_text[:200]}")
         else:
             logger.error(f"Error enviando: {e}")
+            if OWNER_CHAT_ID:
+                await alert_owner(context, f"Error enviando a {conv_id}: {str(e)}")
     except Exception as e:
         logger.error(f"Error enviando: {e}")
+        if OWNER_CHAT_ID:
+            await alert_owner(context, f"Error general enviando: {str(e)}")
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"Error: {context.error}", exc_info=True)
+    logger.error(f"Error global: {context.error}", exc_info=True)
     if OWNER_CHAT_ID and context.error:
         try:
             await context.bot.send_message(
                 chat_id=int(OWNER_CHAT_ID),
-                text=f"💥 Error: {str(context.error)[:400]}"
+                text=f"💥 Error global: {str(context.error)[:400]}"
             )
         except:
             pass
