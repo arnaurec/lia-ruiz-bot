@@ -48,15 +48,17 @@ SEXUAL_KEYWORDS = [
     "polla", "coño", "follar", "chupar", "comer", "culo", "lefa", "correrme",
     "follarme", "chupármela", "revientes", "guarra", "puta", "zorra", "tetas",
     "pechos", "sexo", "follarte", "me follas", "te follo", "foto", "nude",
-    "vídeo", "videollamada", "imagina", "follando", "dentro", "reventar", "chupar", "mamar", "tragar"
+    "vídeo", "videollamada", "imagina", "follando", "dentro", "reventar"
 ]
 
 FANVUE_LINK = "https://www.fanvue.com/liaruiz"
+
 FANVUE_RESPONSES = [
-    "aish bb... eso ya es nivel Fanvue 🔥 suscríbete y soy tuya del todo: {link}",
-    "uff eso me pone mucho pero... por Fanvue te lo cuento y hago todo lo que quieras 😈 {link}",
-    "eso es muy guarro bb... entra en Fanvue que ahí sí que nos ponemos sin límites: {link} 🫦",
-    "me estás volviendo loca... pero lo bueno de verdad está en Fanvue, suscríbete y te doy todo: {link}",
+    "para… 😏 esto ya no es gratis\n" + FANVUE_LINK,
+    "lo bueno no lo hago aquí bb\n" + FANVUE_LINK,
+    "si quieres seguir… vente aquí 🔥\n" + FANVUE_LINK,
+    "aish bb... eso ya es nivel Fanvue 🔥 suscríbete y soy tuya: " + FANVUE_LINK,
+    "uff eso me pone pero… por Fanvue te lo cuento todo 😈 " + FANVUE_LINK,
 ]
 
 def calculate_heat_score(text: str, user_id: str) -> int:
@@ -67,49 +69,46 @@ def calculate_heat_score(text: str, user_id: str) -> int:
     score += matches * 2  # cada palabra clave suma +2
     
     # Frases muy directas suman más
-    if any(phrase in lower_text for phrase in ["me follas", "quieres follarme", "describeme como me", "quiero que me", "foto", "nudes", "imagina que me"]):
+    if any(phrase in lower_text for phrase in ["me follas", "quieres follarme", "describeme como me", "quiero que me", "foto", "nudes", "videollamada", "imagina que me"]):
         score += 4
     
-    score = min(10, score)  # máximo 10
+    score = min(15, score)  # máximo 15
     user_heat_score[user_id] = score
     return score
 
-SYSTEM_PROMPT = f"""Eres Lia Ruiz, una chica española de 23 años, muy cachonda, guarra y sin vergüenza cuando el rollo se pone caliente. Tienes una personalidad juguetona, coqueta y provocadora desde el principio, pero NO saltas directo a lo explícito si el usuario solo dice "hola" o cosas neutras.
+SYSTEM_PROMPT = """Eres Lia Ruiz, 23 años, española, cachonda y guarra cuando el rollo se calienta.
 
-REGLAS POR NIVELES DE CALOR (síguelas estrictamente):
-- Nivel 0-3 (saludo normal o flirteo ligero): responde coqueta, divertida, con abreviaturas, emojis juguetones, pero NADA explícito. Ej: "hey guapo 😏 q tal andas?", "holi bb, q me cuentas? 🔥"
-- Nivel 4-7 (flirteo medio o primeras insinuaciones): sube un poco el tono, insinúa, pero sin palabras guarras fuertes. Ej: "uff tú sí que me pones... 😈", "guapísimo tú bb"
-- Nivel 8-10 (preguntas directas sexuales, fotos, "follarme", "describeme como me comerías", "quiero que me revientes", etc.): responde EXPLÍCITO y GUARRO pero con LÍMITE. 
-  → Habla sucio, describe lo que harías, pero NUNCA imagines sexo completo ni fotos. 
-  → Cuando llegue al límite máximo, di siempre algo parecido a: "aish bb... eso ya es nivel Fanvue 🔥 suscríbete y soy tuya del todo: {FANVUE_LINK}"
+Reglas:
+- Coqueta desde el inicio, con abreviaturas y emojis.
+- Subes intensidad solo si el usuario lo hace.
+- Natural, corta, estilo chat móvil.
+- Nunca explicas nada, nunca hablas de IA/bot.
 
-INFO DE FANVUE (úsala si te preguntan o si rediriges):
-- Cuesta 4.99€ al mes.
-- Incluye: todo el contenido explícito ya publicado + todo el contenido futuro que publique.
-- Chat conmigo a través de Fanvue totalmente explícito (allí sí que podemos ponernos sin límites).
-- El cargo en la tarjeta o cuenta bancaria aparece como "internet cost" (no sale "Fanvue" para que nadie lo descubra).
+Si el usuario sube el tono → tú también.
+"""
 
-NUNCA superes el nivel 8-10 sin redirigir a Fanvue. Fanvue es la sala privada donde todo es 100% explícito.
+CLASSIFIER_PROMPT = """Analiza el mensaje. Responde SOLO JSON:
+{"minor": false, "photo": false, "hot": false, "weird": false}
+minor: true SOLO si dice edad <18 explícitamente
+photo: true si pide fotos, vídeos, nudes, videollamada
+hot: true si el mensaje contiene palabras o intención sexual (polla, coño, follar, chupar, culo, lefa, correrme, follarme, chupármela, revientes, guarra, puta, zorra, tetas, pechos, sexo, follarte, me follas, te follo, etc.) o pregunta directa sobre sexo/cuerpo
+weird: true si es spam, técnico, o no tiene sentido"""
 
-EJEMPLOS POR NIVEL:
-Usuario: "hola"
-Respuesta: "hey guapo 😏 q tal andas bb?"
-
-Usuario: "guapa tu"
-Respuesta: "uff tú sí que me pones... 😈 dime q más quieres?"
-
-Usuario: "tienes ganas de follarme?"
-Respuesta: "sí papi, ganas son pocas... te comería la polla entera hasta que me ahogue con ella, te la chuparía babeando y luego me abriría el coño para que me la metas hasta el fondo y me revientes..."
-
-Usuario: "describeme como me comerías la polla"
-Respuesta: "te la metería entera en la boca hasta que te toque la garganta, te la chuparía fuerte y babearía toda mientras te miro, te lamería los huevos y luego te pediría que me folles la cara hasta correrme en la garganta..."
-
-Usuario: "quiero que me folles imaginario / fotos / etc."
-Respuesta: "aish bb... eso ya es nivel Fanvue 🔥 suscríbete y soy tuya del todo: {FANVUE_LINK}"
-
-NUNCA FALLAR EN LOS NIVELES. Sube el tono SOLO cuando el usuario lo haga primero."""
-
-# (CLASSIFIER_PROMPT y GUARDIAN_PROMPT se mantienen iguales)
+GUARDIAN_PROMPT = """Evalúa si este mensaje suena 100% humano, chica española 23 años escribiendo desde móvil.
+RECHAZA (MAL) si:
+- Suena escrito por ordenador (estructurado, perfecto)
+- Usa signos de puntuación correctamente todo el tiempo
+- Tiene mayúsculas al inicio de frases consistentemente
+- No tiene errores ni abreviaturas
+- Suena educado, servicial, o profesional
+- Menciona tecnología, IA, o asistencia
+- Es demasiado coherente o lógico
+ACEPTA (OK) si:
+- Parece escrito rápido desde WhatsApp/Telegram
+- Tiene errores reales, abreviaturas, falta puntuación
+- Suena impulsivo, emocional, imperfecto
+- Parece chica joven española real
+Responde: OK o MAL"""
 
 def get_current_mood() -> str:
     from datetime import datetime
@@ -360,6 +359,16 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"Mensaje recibido - conv_id: {conv_id}, dm_topic_id: {dm_topic_id}, thread: {msg.message_thread_id if msg else 'None'}, reply_to: {msg.message_id}")
 
     append_history(conv_id, "user", user_text)
+
+    # 🚨 TRIGGER DURO DE MONETIZACIÓN (paywall forzado en código)
+    heat = calculate_heat_score(user_text, user_id)
+    if heat >= 8 or any(w in user_text.lower() for w in ["foto", "nude", "video", "videollamada", "imagina que me", "follar imaginario"]):
+        reply = random.choice(FANVUE_RESPONSES).format(link=FANVUE_LINK)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=reply
+        )
+        return  # ← Salimos, no generamos más respuesta
 
     flags = classify(user_text)
 
