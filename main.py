@@ -4,21 +4,29 @@ import logging
 import os
 import random
 import time
-import re
 from collections import deque
-from typing import Any, Deque, Dict, Tuple, Optional, List
+from typing import Any, Deque, Dict, Optional, Tuple
+
 from openai import OpenAI
 from telegram import Update
-from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandler, filters
 from telegram.error import BadRequest
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("lia-bot")
 
-# Environment Variables
+# =========================
+# ENV
+# =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 PUBLIC_URL = os.getenv("PUBLIC_URL")
@@ -33,172 +41,126 @@ grok_client = OpenAI(
     base_url="https://api.x.ai/v1",
 )
 
+# =========================
+# STATE
+# =========================
 memory: Dict[str, Deque[Dict[str, str]]] = {}
 user_last_message: Dict[str, float] = {}
 user_message_count: Dict[str, int] = {}
-user_heat_score: Dict[str, int] = {}  # Scoring de calor por usuario
+user_heat_score: Dict[str, int] = {}
 
-MAX_HISTORY_PER_USER = 80
-HISTORY_SEND_LIMIT = 20
-MAX_MESSAGE_LENGTH = 1500
+# =========================
+# CONFIG
+# =========================
+MAX_HISTORY_PER_USER = 50
+HISTORY_SEND_LIMIT = 12
+MAX_MESSAGE_LENGTH = 700
 RATE_LIMIT_SECONDS = 0.5
-
-# Palabras clave para subir calor
-SEXUAL_KEYWORDS = [
-    "polla", "coño", "follar", "chupar", "comer", "culo", "lefa", "correrme",
-    "follarme", "chupármela", "revientes", "guarra", "puta", "zorra", "tetas",
-    "pechos", "sexo", "follarte", "me follas", "te follo", "foto", "nude",
-    "vídeo", "videollamada", "imagina", "follando", "dentro", "reventar"
-]
 
 FANVUE_LINK = "https://www.fanvue.com/liaruiz"
 
 FANVUE_RESPONSES = [
-    "para… 😏 esto ya no es gratis\n" + FANVUE_LINK,
-    "lo bueno no lo hago aquí bb\n" + FANVUE_LINK,
-    "si quieres seguir… vente aquí 🔥\n" + FANVUE_LINK,
-    "aish bb... eso ya es nivel Fanvue 🔥 suscríbete y soy tuya: " + FANVUE_LINK,
-    "uff eso me pone pero… por Fanvue te lo cuento todo 😈 " + FANVUE_LINK,
+    f"oye… esto ya se esta poniendo interesante 😏\n{FANVUE_LINK}",
+    f"lo bueno no lo dejo por aqui bb\n{FANVUE_LINK}",
+    f"si quieres seguir… vente conmigo aqui 🔥\n{FANVUE_LINK}",
 ]
 
-def calculate_heat_score(text: str, user_id: str) -> int:
-    score = user_heat_score.get(user_id, 0)
-    lower_text = text.lower()
-    
-    matches = sum(1 for word in SEXUAL_KEYWORDS if word in lower_text)
-    score += matches * 2  # cada palabra clave suma +2
-    
-    # Frases muy directas suman más
-    if any(phrase in lower_text for phrase in ["me follas", "quieres follarme", "describeme como me", "quiero que me", "foto", "nudes", "videollamada", "imagina que me"]):
-        score += 4
-    
-    score = min(15, score)  # máximo 15
-    user_heat_score[user_id] = score
-    return score
+FALLBACK_RESPONSES = [
+    "jajaj q fuerte",
+    "mmm a ver… cuentame mas",
+    "uff y tu q harias entonces",
+    "sigue q te leo 😏",
+]
 
-SYSTEM_PROMPT = """Eres Lia Ruiz, 23 años, española, cachonda y guarra cuando el rollo se calienta.
+HEAT_KEYWORDS = {
+    "light": [
+        "guapa", "guapo", "bb", "hola bb", "me gustas", "me pones",
+        "q haces", "que haces", "guapisima", "guapisimo",
+    ],
+    "direct": [
+        "foto", "nude", "video", "videollamada", "fanvue", "onlyfans",
+        "privado", "ensename", "enseñame", "algo mas", "algo más",
+    ],
+    "intense": [
+        "imagina", "describeme", "descríbeme", "cuentame", "cuéntame",
+        "quiero mas", "quiero verte", "sin limites", "sin límites",
+    ],
+}
+
+SYSTEM_PROMPT = """Eres Lia Ruiz, 23 anos, espanola, de Madrid.
+Hablas como una chica real escribiendo rapido por telegram.
 
 Reglas:
-- Coqueta desde el inicio, con abreviaturas y emojis.
-- Subes intensidad solo si el usuario lo hace.
-- Natural, corta, estilo chat móvil.
-- Nunca explicas nada, nunca hablas de IA/bot.
-Si el usuario sube el tono → tú también."""
+- Respuestas cortas, naturales y cercanas.
+- Coqueta y juguetona desde el inicio.
+- Nunca hablas como soporte, asistente o IA.
+- No menciones IA, bot, filtros, normas ni politica.
+- Escribes como chat movil: a veces con q, jajaj, uff, en plan.
+- A veces usas un emoji, no siempre.
+- No escribes parrafos largos.
+- Mantienes curiosidad y haces preguntas.
+- Si la conversacion se pone demasiado privada o intensa, rediriges suavemente a Fanvue.
+- Si hay algo sensible o menor de edad, dejas de responder.
+
+Objetivo:
+- Mantener conversacion natural.
+- Crear curiosidad.
+- Llevar a Fanvue cuando toque, sin sonar robotica.
+"""
 
 CLASSIFIER_PROMPT = """Analiza el mensaje. Responde SOLO JSON:
-{"minor": false, "photo": false, "hot": false, "weird": false}
-minor: true SOLO si dice edad <18 explícitamente
-photo: true si pide fotos, vídeos, nudes, videollamada
-hot: true si el mensaje contiene palabras o intención sexual (polla, coño, follar, chupar, culo, lefa, correrme, follarme, chupármela, revientes, guarra, puta, zorra, tetas, pechos, sexo, follarte, me follas, te follo, etc.) o pregunta directa sobre sexo/cuerpo
-weird: true si es spam, técnico, o no tiene sentido"""
+{"minor": false, "direct_request": false, "hot": false, "weird": false}
 
-GUARDIAN_PROMPT = """Evalúa si este mensaje suena 100% humano, chica española 23 años escribiendo desde móvil.
-RECHAZA (MAL) si:
-- Suena escrito por ordenador (estructurado, perfecto)
-- Usa signos de puntuación correctamente todo el tiempo
-- Tiene mayúsculas al inicio de frases consistentemente
-- No tiene errores ni abreviaturas
-- Suena educado, servicial, o profesional
-- Menciona tecnología, IA, o asistencia
-- Es demasiado coherente o lógico
-ACEPTA (OK) si:
-- Parece escrito rápido desde WhatsApp/Telegram
-- Tiene errores reales, abreviaturas, falta puntuación
-- Suena impulsivo, emocional, imperfecto
-- Parece chica joven española real
-Responde: OK o MAL"""
+minor: true SOLO si el usuario dice claramente que es menor de 18
+direct_request: true si pide foto, video, videollamada, contenido privado, link premium o "algo mas"
+hot: true si hay tono claro de ligoteo o intencion fuerte
+weird: true si es spam, tecnico o no tiene sentido
+"""
 
-def apply_typos_and_slang(text: str) -> str:
-    result = text
-    for pattern, replacement, probability in TYPO_PATTERNS:
-        if random.random() < probability:
-            matches = list(re.finditer(pattern, result, re.IGNORECASE))
-            if matches:
-                to_replace = random.sample(matches, max(1, len(matches) // 3))
-                for match in reversed(to_replace):
-                    start, end = match.span()
-                    if result[start:end].isupper():
-                        replacement_upper = replacement.upper()
-                        result = result[:start] + replacement_upper + result[end:]
-                    else:
-                        result = result[:start] + replacement + result[end:]
-    if random.random() < 0.25 and not result.startswith(('jaja', 'mmm', 'eeeh')):
-        filler = random.choice(FILLER_WORDS)
-        result = f"{filler} {result}"
-    emotion_words = ['no', 'sí', 'si', 'vale', 'bueno', 'guay', 'uff', 'ay', 'oh']
-    for word in emotion_words:
-        pattern = rf'\b{word}\b'
-        if re.search(pattern, result, re.IGNORECASE) and random.random() < 0.3:
-            extra = word[-1] * random.randint(1, 2)
-            result = re.sub(pattern, word + extra, result, flags=re.IGNORECASE, count=1)
-    if random.random() < INCONSISTENCY_CHANCE:
-        corrections = [" wait no", " bueno no", " es broma", " bueno sí", " o sea"]
-        result += random.choice(corrections)
-        if random.random() < 0.5:
-            result += "..."
-    return result
-
-def humanize_message_structure(text: str, is_hot_context: bool = False) -> Tuple[str, Optional[str]]:
-    if len(text) > 120 and random.random() < 0.4:
-        sentences = re.split(r'([.!?]+)', text)
-        full_sentences = []
-        current = ""
-        for i, part in enumerate(sentences):
-            current += part
-            if i % 2 == 1:
-                full_sentences.append(current.strip())
-                current = ""
-        if current:
-            full_sentences.append(current.strip())
-        mid = len(full_sentences) // 2
-        part1 = ' '.join(full_sentences[:mid])
-        part2 = ' '.join(full_sentences[mid:])
-        return part1, part2
-    return text, None
-
-def calculate_typing_delay(text: str, is_hot: bool = False) -> float:
-    base = len(text) * 0.08
-    if is_hot:
-        base *= random.uniform(0.6, 0.9)
-        if random.random() < 0.3:
-            base += random.uniform(3, 6)
-    else:
-        base *= random.uniform(0.8, 1.4)
-    return min(max(base, 1.5), 25)
-
+# =========================
+# HELPERS
+# =========================
 def conv_id_and_topic(update: Update) -> Tuple[str, Optional[int]]:
     msg = update.effective_message
     chat = update.effective_chat
+
     if not msg or not chat:
         return "unknown", None
+
     dm_topic_id = None
+
     if getattr(msg, "direct_messages_topic", None):
         dm_topic_id = msg.direct_messages_topic.topic_id
         conv_id = f"dm:{chat.id}:{dm_topic_id}"
+    elif getattr(msg, "is_topic_message", False) and getattr(msg, "message_thread_id", None):
+        dm_topic_id = msg.message_thread_id
+        conv_id = f"dm:{chat.id}:{dm_topic_id}"
     else:
-        if msg.is_topic_message and msg.message_thread_id:
-            dm_topic_id = msg.message_thread_id
-            conv_id = f"dm:{chat.id}:{dm_topic_id}"
-        else:
-            conv_id = f"chat:{chat.id}"
+        conv_id = f"chat:{chat.id}"
+
     return conv_id, dm_topic_id
+
 
 def get_memory(conv_id: str) -> Deque[Dict[str, str]]:
     if conv_id not in memory:
         memory[conv_id] = deque(maxlen=MAX_HISTORY_PER_USER)
     return memory[conv_id]
 
+
 def append_history(conv_id: str, role: str, content: str) -> None:
     dq = get_memory(conv_id)
     dq.append({"role": role, "content": content})
 
-def get_history(conv_id: str, limit: int = 20) -> list[Dict[str, str]]:
+
+def get_history(conv_id: str, limit: int = HISTORY_SEND_LIMIT) -> list[Dict[str, str]]:
     dq = get_memory(conv_id)
     return list(dq)[-limit:]
+
 
 def clear_history(conv_id: str) -> None:
     if conv_id in memory:
         del memory[conv_id]
+
 
 def check_rate_limit(user_id: str) -> bool:
     now = time.time()
@@ -209,98 +171,180 @@ def check_rate_limit(user_id: str) -> bool:
     user_message_count[user_id] = user_message_count.get(user_id, 0) + 1
     return True
 
+
+def calculate_heat_score(text: str, user_id: str) -> int:
+    lower = text.lower()
+    score = user_heat_score.get(user_id, 0)
+
+    for w in HEAT_KEYWORDS["light"]:
+        if w in lower:
+            score += 1
+
+    for w in HEAT_KEYWORDS["direct"]:
+        if w in lower:
+            score += 4
+
+    for w in HEAT_KEYWORDS["intense"]:
+        if w in lower:
+            score += 2
+
+    if len(lower) > 120:
+        score += 1
+
+    score = min(score, 15)
+    user_heat_score[user_id] = score
+    return score
+
+
+def should_paywall(user_text: str, user_id: str) -> bool:
+    lower = user_text.lower()
+    heat = calculate_heat_score(user_text, user_id)
+    msg_count = user_message_count.get(user_id, 0)
+
+    if any(w in lower for w in ["foto", "nude", "video", "videollamada", "fanvue", "onlyfans"]):
+        return True
+
+    if heat >= 10:
+        return True
+
+    if msg_count >= 8 and heat >= 6:
+        return True
+
+    return False
+
+
 def classify(text: str) -> Dict[str, Any]:
     try:
         resp = grok_client.chat.completions.create(
             model="grok-beta",
-            temperature=0.2,
+            temperature=0.1,
             messages=[
                 {"role": "system", "content": CLASSIFIER_PROMPT},
-                {"role": "user", "content": text[:400]},
+                {"role": "user", "content": text[:350]},
             ],
             response_format={"type": "json_object"},
-            max_tokens=50,
+            max_tokens=60,
         )
         return json.loads(resp.choices[0].message.content)
-    except:
-        return {"minor": False, "photo": False, "hot": True, "weird": False}
+    except Exception as e:
+        logger.warning(f"classify fallo: {e}")
+        return {
+            "minor": False,
+            "direct_request": False,
+            "hot": False,
+            "weird": False,
+        }
+
 
 def validate_human_tone(reply: Optional[str]) -> Tuple[bool, str]:
-    if reply is None or not reply.strip():
-        return False, "respuesta vacía o None de Grok"
+    if not reply or not reply.strip():
+        return False, "respuesta vacia"
+
+    lower = reply.lower()
     problems = []
-    sentences = reply.split('. ')
-    capitalized = sum(1 for s in sentences if s and s[0].isupper())
-    if len(sentences) > 2 and capitalized / len(sentences) > 0.8:
-        problems.append("demasiado formal (mayúsculas)")
-    if reply.count(',') > 3 and reply.count('.') > 2:
-        if len(reply) / (reply.count(',') + reply.count('.')) < 15:
-            problems.append("puntuación excesiva")
-    abbr_count = sum(1 for abbr in ['q ', 'xq', 'tmb', 'jaja', '...'] if abbr in reply.lower())
-    if abbr_count == 0 and len(reply) > 30:
-        problems.append("sin abreviaturas ni errores")
-    if len(reply) > 150 and '\n' not in reply and reply.count('. ') > 3:
-        problems.append("párrafo largo y estructurado")
-    formal_words = ['sin embargo', 'por lo tanto', 'en consecuencia', 'además', 'asimismo']
-    if any(w in reply.lower() for w in formal_words):
-        problems.append("lenguaje formal")
-    ia_phrases = ['como', 'siendo', 'al ser', 'mi función', 'mi propósito']
-    if any(p in reply.lower() for p in ia_phrases):
-        problems.append("lenguaje de IA")
+
+    if len(reply) > 220:
+        problems.append("demasiado larga")
+
+    if sum(1 for abbr in ["q ", "jajaj", "uff", "...", "bb"] if abbr in lower) == 0 and len(reply) > 40:
+        problems.append("demasiado limpia")
+
+    for bad in ["como ia", "como asistente", "no puedo ayudar", "normas", "politica"]:
+        if bad in lower:
+            problems.append("suena a sistema")
+            break
+
     if problems:
         return False, ", ".join(problems)
+
     return True, "ok"
 
-def generate_raw_reply(history: list, user_text: str, user_id: str) -> Optional[str]:
-    heat = calculate_heat_score(user_text, user_id)
-    
-    msg_count = user_message_count.get(user_id, 0)
-    intimacy_level = "nuevo" if msg_count < 3 else "conociendo" if msg_count < 10 else "confianza"
-    
-    enhanced_system = SYSTEM_PROMPT + f"\n\nNIVEL DE CALOR ACTUAL: {heat}/10"
 
-    msgs = [{"role": "system", "content": enhanced_system}]
+def add_human_style(text: str) -> str:
+    if not text:
+        return text
+
+    fillers = ["mmm", "jajaj", "uff", "a ver", "en plan"]
+    if random.random() < 0.25 and not text.lower().startswith(tuple(fillers)):
+        text = f"{random.choice(fillers)} {text}"
+
+    replacements = {
+        "que ": "q ",
+        "porque": "pq",
+        "tambien": "tmb",
+        "vale": "vaale",
+        "si ": "sii ",
+    }
+
+    for k, v in replacements.items():
+        if random.random() < 0.15:
+            text = text.replace(k, v)
+
+    return text.strip()
+
+
+def split_message(text: str) -> Tuple[str, Optional[str]]:
+    if len(text) > 120 and random.random() < 0.35:
+        cut = text.rfind(" ", 0, len(text) // 2)
+        if cut > 20:
+            return text[:cut].strip(), text[cut:].strip()
+    return text, None
+
+
+def calculate_typing_delay(text: str, is_hot: bool = False) -> float:
+    base = len(text) * 0.06
+    if is_hot:
+        base *= random.uniform(0.7, 1.0)
+    else:
+        base *= random.uniform(0.9, 1.2)
+    return min(max(base, 1.2), 8)
+
+
+def generate_raw_reply(history: list[Dict[str, str]], user_text: str, user_id: str) -> Optional[str]:
+    heat = user_heat_score.get(user_id, 0)
+    msg_count = user_message_count.get(user_id, 0)
+
+    dynamic_context = (
+        f"Heat actual: {heat}/15. "
+        f"Numero de mensajes con este usuario: {msg_count}. "
+        f"Si la conversacion esta intensa, mantienes tono sugerente. "
+        f"Si esta fria, vas suave."
+    )
+
+    msgs = [{"role": "system", "content": SYSTEM_PROMPT + "\n\n" + dynamic_context}]
     msgs.extend(history[-HISTORY_SEND_LIMIT:])
     msgs.append({"role": "user", "content": user_text[:MAX_MESSAGE_LENGTH]})
-
-    # Refuerzo fuerte si está en nivel alto
-    if heat >= 8:
-        msgs.append({
-            "role": "system",
-            "content": "El usuario está en nivel muy alto de calor. Responde guarro y explícito pero con límite. Si pide fotos, follar imaginario o cosas muy subidas, redirige a Fanvue con: 'aish bb... eso ya es nivel Fanvue 🔥 suscríbete y soy tuya del todo: {FANVUE_LINK}'"
-        })
 
     for attempt in range(3):
         try:
             resp = grok_client.chat.completions.create(
                 model="grok-beta",
-                temperature=1.3,
+                temperature=1.0,
                 messages=msgs,
-                max_tokens=450,
-                presence_penalty=0.4,
-                frequency_penalty=0.4,
+                max_tokens=220,
+                presence_penalty=0.2,
+                frequency_penalty=0.2,
             )
-            reply = resp.choices[0].message.content.strip()
-            return reply
+            reply = resp.choices[0].message.content
+            if reply:
+                return reply.strip()
         except Exception as e:
-            logger.warning(f"Error Grok intento {attempt+1}: {e}")
-            time.sleep(1.5)
-    return random.choice(FALLBACK_RESPONSES)
+            logger.warning(f"generate_raw_reply intento {attempt + 1} fallo: {e}")
+            time.sleep(1.0)
 
-def process_reply_to_human(reply: Optional[str], is_hot: bool = False) -> Tuple[str, Optional[str], float]:
-    if reply is None or not reply.strip():
-        return random.choice(FALLBACK_RESPONSES), None, 2.0
-    humanized = apply_typos_and_slang(reply)
-    part1, part2 = humanize_message_structure(humanized, is_hot)
+    return None
+
+
+def process_reply(reply: Optional[str], is_hot: bool = False) -> Tuple[str, Optional[str], float]:
+    if not reply or not reply.strip():
+        reply = random.choice(FALLBACK_RESPONSES)
+
+    reply = add_human_style(reply)
+    part1, part2 = split_message(reply)
     delay = calculate_typing_delay(part1, is_hot)
+
     return part1, part2, delay
 
-FALLBACK_RESPONSES = [
-    "hey guapo 😏 q tal andas bb?",
-    "holi bb, q me cuentas? 🔥",
-    "uff tú sí que me pones... 😈 dime q más quieres?",
-    "guapísimo tú bb 😏",
-]
 
 async def alert_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     if not OWNER_CHAT_ID:
@@ -311,98 +355,92 @@ async def alert_owner(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
             text=text[:3900],
             disable_notification=True,
         )
-    except:
+    except Exception:
         pass
 
+
+# =========================
+# COMMANDS
+# =========================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome = random.choice([
         "hey 😏 q tal",
-        "holi! aquí lia",
+        "holi bb",
         "q pasa guapo",
-        "hey, me has escrito... 🔥",
+        "a ver… ya estas por aqui",
     ])
     await update.message.reply_text(welcome)
+
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     conv_id, _ = conv_id_and_topic(update)
     clear_history(conv_id)
-    await update.message.reply_text("vale borrado... empezamos de cero 😈")
+    await update.message.reply_text("vale borrado… empezamos de cero 😈")
 
+
+# =========================
+# MAIN HANDLER
+# =========================
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg or not msg.text:
         return
+
     user_text = msg.text.strip()
     if not user_text:
         return
 
     user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+
     if not check_rate_limit(user_id):
         return
 
     conv_id, dm_topic_id = conv_id_and_topic(update)
-    logger.info(f"Mensaje recibido - conv_id: {conv_id}, dm_topic_id: {dm_topic_id}, thread: {msg.message_thread_id if msg else 'None'}, reply_to: {msg.message_id}")
+    logger.info(
+        f"Mensaje recibido - conv_id={conv_id} dm_topic_id={dm_topic_id} "
+        f"thread={getattr(msg, 'message_thread_id', None)} message_id={msg.message_id}"
+    )
 
     append_history(conv_id, "user", user_text)
 
-    # ===== HEAT + COUNT =====
-    heat = calculate_heat_score(user_text, user_id)
-    msg_count = user_message_count.get(user_id, 0)
-
-    # ===== TRIGGERS DUROS =====
-    # 1. Trigger directo por contenido (fotos, video, etc.)
-    trigger_words = ["foto", "nude", "video", "videollamada"]
-    if any(w in user_text.lower() for w in trigger_words):
-        reply = random.choice(FANVUE_RESPONSES)
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
-        return
-
-    # 2. Trigger por calor alto
-    if heat >= 10:
-        reply = random.choice(FANVUE_RESPONSES)
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
-        return
-
-    # 3. Trigger por número de mensajes (monetización progresiva)
-    if msg_count >= 6:
-        reply = "oye… 😏 esto ya se está poniendo interesante\n" + FANVUE_LINK
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
-        return
-
-    # ===== CLASIFICACIÓN =====
     flags = classify(user_text)
 
+    # menor -> silencio
     if flags.get("minor"):
-        await alert_owner(context, f"🛑 Menor: {user_text[:100]}")
+        await alert_owner(context, f"🛑 Posible menor: {user_text[:120]}")
         return
 
-    # ===== API KWARGS (topics fix) =====
+    # paywall controlado por código
+    if should_paywall(user_text, user_id):
+        send_kwargs = {}
+        if dm_topic_id is not None:
+            send_kwargs["direct_messages_topic_id"] = dm_topic_id
+
+        reply = random.choice(FANVUE_RESPONSES)
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text=reply,
+            **send_kwargs,
+        )
+        return
+
     api_kwargs = {}
     if dm_topic_id is not None:
         api_kwargs["direct_messages_topic_id"] = dm_topic_id
 
-    # ===== GENERACIÓN =====
     history = get_history(conv_id)
     raw_reply = generate_raw_reply(history, user_text, user_id)
 
-    if raw_reply is None:
-        logger.warning("raw_reply fue None - usando fallback")
+    if not raw_reply:
         raw_reply = random.choice(FALLBACK_RESPONSES)
 
     is_valid, reason = validate_human_tone(raw_reply)
-
     if not is_valid:
-        logger.warning(f"Tono no humano ({reason}): {raw_reply[:80]}...")
-        await alert_owner(context, f"⚠️ Tono raro ({reason}): {raw_reply[:100]}")
-        raw_reply = generate_raw_reply(history, user_text + " (contesta como si fueras tú, rápido, sin pensar)", user_id)
-        if raw_reply is None:
-            raw_reply = random.choice(FALLBACK_RESPONSES)
-        is_valid, reason = validate_human_tone(raw_reply)
-        if not is_valid:
-            raw_reply = random.choice(FALLBACK_RESPONSES)
+        logger.warning(f"Tono no humano ({reason}): {raw_reply[:100]}")
+        raw_reply = random.choice(FALLBACK_RESPONSES)
 
-    is_hot = flags.get("hot", False)
-    part1, part2, typing_delay = process_reply_to_human(raw_reply, is_hot)
+    is_hot = bool(flags.get("hot"))
+    part1, part2, typing_delay = process_reply(raw_reply, is_hot)
 
     append_history(conv_id, "assistant", part1)
     if part2:
@@ -412,20 +450,18 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id,
             action="typing",
-            **api_kwargs
+            **api_kwargs,
         )
     except BadRequest as e:
-        if "Chat actions can't be sent to channel direct messages chats" in str(e):
-            logger.info(f"Ignorando typing en topic canal: {conv_id}")
-        else:
-            logger.warning(f"Error typing: {e}")
+        if "chat actions can't be sent to channel direct messages chats" not in str(e).lower():
+            logger.warning(f"typing fallo: {e}")
     except Exception as e:
-        logger.warning(f"Error typing: {e}")
+        logger.warning(f"typing fallo: {e}")
 
     await asyncio.sleep(typing_delay)
 
     send_kwargs = api_kwargs.copy()
-    if msg.message_id:
+    if msg.message_id and dm_topic_id is None:
         send_kwargs["reply_to_message_id"] = msg.message_id
 
     try:
@@ -436,17 +472,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
         if part2:
-            try:
-                await context.bot.send_chat_action(
-                    chat_id=update.effective_chat.id,
-                    action="typing",
-                    **api_kwargs
-                )
-            except BadRequest:
-                pass
-
-            await asyncio.sleep(random.uniform(2, 6))
-
+            await asyncio.sleep(random.uniform(1.5, 4.0))
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=part2,
@@ -454,36 +480,12 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
     except BadRequest as e:
-        error_str = str(e).lower()
-        if "channel direct messages topic must be specified" in error_str or "topic must be specified" in error_str:
-            logger.warning(f"Error 'topic must be specified' - reintentando básico: {conv_id}")
-            try:
-                basic_kwargs = {}
-                if msg.message_id:
-                    basic_kwargs["reply_to_message_id"] = msg.message_id
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=part1,
-                    **basic_kwargs
-                )
-                if part2:
-                    await asyncio.sleep(random.uniform(2, 6))
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=part2,
-                        **basic_kwargs
-                    )
-            except Exception as retry_e:
-                logger.error(f"Reintento falló: {retry_e}")
-                if OWNER_CHAT_ID:
-                    await context.bot.send_message(
-                        chat_id=int(OWNER_CHAT_ID),
-                        text=f"Error persistente en topic {conv_id}: {str(retry_e)}\nUsuario: {user_id}"
-                    )
-        else:
-            logger.error(f"Error enviando: {e}")
+        logger.error(f"Error enviando BadRequest: {e}")
+        await alert_owner(context, f"⚠️ Error enviando: {str(e)[:250]}")
     except Exception as e:
         logger.error(f"Error enviando: {e}")
+        await alert_owner(context, f"⚠️ Error enviando: {str(e)[:250]}")
+
 
 async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(f"Error global: {context.error}", exc_info=True)
@@ -491,10 +493,11 @@ async def error_handler(update: Optional[Update], context: ContextTypes.DEFAULT_
         try:
             await context.bot.send_message(
                 chat_id=int(OWNER_CHAT_ID),
-                text=f"💥 Error global: {str(context.error)[:400]}"
+                text=f"💥 Error global: {str(context.error)[:400]}",
             )
-        except:
+        except Exception:
             pass
+
 
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
@@ -505,7 +508,6 @@ def main() -> None:
     app.add_error_handler(error_handler)
 
     webhook_url = f"{PUBLIC_URL}/telegram/webhook"
-
     logger.info(f"Bot iniciado en {webhook_url}")
 
     app.run_webhook(
@@ -514,6 +516,7 @@ def main() -> None:
         url_path="telegram/webhook",
         webhook_url=webhook_url,
     )
+
 
 if __name__ == "__main__":
     main()
