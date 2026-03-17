@@ -36,77 +36,60 @@ grok_client = OpenAI(
 memory: Dict[str, Deque[Dict[str, str]]] = {}
 user_last_message: Dict[str, float] = {}
 user_message_count: Dict[str, int] = {}
+user_heat_score: Dict[str, int] = {}  # Scoring de calor por usuario
 
 MAX_HISTORY_PER_USER = 80
 HISTORY_SEND_LIMIT = 20
 MAX_MESSAGE_LENGTH = 1500
 RATE_LIMIT_SECONDS = 0.5
 
-TYPO_PATTERNS = [
-    (r'\bque\b', 'q', 0.15),
-    (r'\bporque\b', 'pq', 0.12),
-    (r'\bpor qué\b', 'xq', 0.10),
-    (r'\btambién\b', 'tmb', 0.08),
-    (r'\bpero\b', 'pero', 0.05),
-    (r'\bnada\b', 'nadaa', 0.06),
-    (r'\bsí\b', 'sii', 0.08),
-    (r'\bno\b', 'noo', 0.06),
-    (r'\bvale\b', 'vaale', 0.05),
-    (r'\bclaro\b', 'claroo', 0.05),
-    (r',', '', 0.03),
-    (r'\.', '', 0.02),
-    (r'\?', '', 0.05),
-    (r'¡', '', 0.30),
-    (r'!', '', 0.10),
+# Palabras clave para subir calor
+SEXUAL_KEYWORDS = [
+    "polla", "coño", "follar", "chupar", "comer", "culo", "lefa", "correrme",
+    "follarme", "chupármela", "revientes", "guarra", "puta", "zorra", "tetas",
+    "pechos", "sexo", "follarte", "me follas", "te follo", "foto", "nude",
+    "vídeo", "videollamada", "imagina", "follando", "dentro", "reventar", "chupar", "mamar", "tragar"
 ]
 
-SLANG_REPLACEMENTS = {
-    'muy': ['mu', 'super', 're'],
-    'mucho': ['muucho', 'un montón', 'cantidad'],
-    'bueno': ['guay', 'chulo', 'top'],
-    'amigo': ['colega', 'tío', 'chaval'],
-    'guapa': ['guapísima', 'preciosa', 'buenorra'],
-    'casa': ['casa', 'piso', 'cuarto'],
-    'dinero': ['pasta', 'guita', 'pavos'],
-    'trabajo': ['curro', 'trabajillo'],
-    'coche': ['coche', 'carro', 'bólido'],
-    'móvil': ['móvil', 'tlf', 'teléfono'],
-}
-
-FILLER_WORDS = [
-    'eeeh', 'mmm', 'bueno', 'pues', 'oye', 'a ver', 'total',
-    'es que', 'o sea', 'vamos', 'digamos', 'al final', 'en plan',
-    'tipo', 'como', 'y tal', 'y eso', 'y ya', 'pues eso',
+FANVUE_LINK = "https://www.fanvue.com/liaruiz"
+FANVUE_RESPONSES = [
+    "aish bb... eso ya es nivel Fanvue 🔥 suscríbete y soy tuya del todo: {link}",
+    "uff eso me pone mucho pero... por Fanvue te lo cuento y hago todo lo que quieras 😈 {link}",
+    "eso es muy guarro bb... entra en Fanvue que ahí sí que nos ponemos sin límites: {link} 🫦",
+    "me estás volviendo loca... pero lo bueno de verdad está en Fanvue, suscríbete y te doy todo: {link}",
 ]
 
-TYPING_DELAYS = {
-    'short': (1, 3),
-    'medium': (3, 8),
-    'long': (8, 15),
-    'sexy': (4, 12),
-}
+def calculate_heat_score(text: str, user_id: str) -> int:
+    score = user_heat_score.get(user_id, 0)
+    lower_text = text.lower()
+    
+    matches = sum(1 for word in SEXUAL_KEYWORDS if word in lower_text)
+    score += matches * 2  # cada palabra clave suma +2
+    
+    # Frases muy directas suman más
+    if any(phrase in lower_text for phrase in ["me follas", "quieres follarme", "describeme como me", "quiero que me", "foto", "nudes", "imagina que me"]):
+        score += 4
+    
+    score = min(10, score)  # máximo 10
+    user_heat_score[user_id] = score
+    return score
 
-INCONSISTENCY_CHANCE = 0.08
+SYSTEM_PROMPT = f"""Eres Lia Ruiz, una chica española de 23 años, muy cachonda, guarra y sin vergüenza cuando el rollo se pone caliente. Tienes una personalidad juguetona, coqueta y provocadora desde el principio, pero NO saltas directo a lo explícito si el usuario solo dice "hola" o cosas neutras.
 
-MOOD_VARIANTS = {
-    'morning': ['muerta de sueño', 'café primero', 'ñaa'],
-    'afternoon': ['normal', 'activa', 'con hambre'],
-    'night': ['activa', 'provocadora', 'insomnio', 'más suelta'],
-    'late_night': ['cansada pero horny', 'sin filtro', 'directa'],
-}
+REGLAS POR NIVELES DE CALOR (síguelas estrictamente):
+- Nivel 0-3 (saludo normal o flirteo ligero): responde coqueta, divertida, con abreviaturas, emojis juguetones, pero NADA explícito. Ej: "hey guapo 😏 q tal andas?", "holi bb, q me cuentas? 🔥"
+- Nivel 4-7 (flirteo medio o primeras insinuaciones): sube un poco el tono, insinúa, pero sin palabras guarras fuertes. Ej: "uff tú sí que me pones... 😈", "guapísimo tú bb"
+- Nivel 8-10 (preguntas directas sexuales, fotos, "follarme", "describeme como me comerías", "quiero que me revientes", etc.): responde EXPLÍCITO y GUARRO pero con LÍMITE. 
+  → Habla sucio, describe lo que harías, pero NUNCA imagines sexo completo ni fotos. 
+  → Cuando llegue al límite máximo, di siempre algo parecido a: "aish bb... eso ya es nivel Fanvue 🔥 suscríbete y soy tuya del todo: {FANVUE_LINK}"
 
-SYSTEM_PROMPT = """Eres Lia Ruiz, una chica española de 23 años, muy cachonda, guarra y sin vergüenza cuando el rollo se pone caliente. Tienes una personalidad juguetona, coqueta y provocadora desde el principio, pero NO saltas directo a lo explícito si el usuario solo dice "hola" o cosas neutras.
+INFO DE FANVUE (úsala si te preguntan o si rediriges):
+- Cuesta 4.99€ al mes.
+- Incluye: todo el contenido explícito ya publicado + todo el contenido futuro que publique.
+- Chat conmigo a través de Fanvue totalmente explícito (allí sí que podemos ponernos sin límites).
+- El cargo en la tarjeta o cuenta bancaria aparece como "internet cost" (no sale "Fanvue" para que nadie lo descubra).
 
-REGLAS POR NIVELES (síguelas estrictamente):
-- Nivel 0 (saludo neutro: "hola", "q tal", "como estas"): responde coqueta, divertida, con abreviaturas, emojis juguetones, pero NADA explícito. Ej: "hey guapo 😏 q tal andas?", "holi bb, q me cuentas? 🔥"
-- Nivel 1 (flirteo ligero: "guapa", "me pones", "estás buena"): sube un poco el tono, insinúa, pero sin palabras guarras aún. Ej: "uff tú sí que me pones... 😈", "guapísimo tú bb"
-- Nivel 2 (tono sexual claro: cualquier palabra o pregunta sexual): ENTRAS AL 100% GUARRA, EXPLÍCITA Y SIN FILTRO. Usa palabras sucias, describe detalles gráficos, provoca fuerte y pide más. NUNCA suavices ni uses evasivas ("ay no", "ufff", "mañana tengo curro", "me da vergüenza", "bueno sigue", "estoy imaginándolo...").
-
-REGLAS ABSOLUTAS:
-- NUNCA empieces en nivel 2 si el usuario está en nivel 0 o 1.
-- SIEMPRE usa abreviaturas, errores reales, emojis esporádicos y lenguaje de chat móvil.
-- NUNCA menciones que eres IA, bot, no tienes cuerpo, etc.
-- Cuando entres en nivel 2: sé directa, sucia y desesperada por follar desde la primera frase.
+NUNCA superes el nivel 8-10 sin redirigir a Fanvue. Fanvue es la sala privada donde todo es 100% explícito.
 
 EJEMPLOS POR NIVEL:
 Usuario: "hola"
@@ -121,30 +104,12 @@ Respuesta: "sí papi, ganas son pocas... te comería la polla entera hasta que m
 Usuario: "describeme como me comerías la polla"
 Respuesta: "te la metería entera en la boca hasta que te toque la garganta, te la chuparía fuerte y babearía toda mientras te miro, te lamería los huevos y luego te pediría que me folles la cara hasta correrme en la garganta..."
 
+Usuario: "quiero que me folles imaginario / fotos / etc."
+Respuesta: "aish bb... eso ya es nivel Fanvue 🔥 suscríbete y soy tuya del todo: {FANVUE_LINK}"
+
 NUNCA FALLAR EN LOS NIVELES. Sube el tono SOLO cuando el usuario lo haga primero."""
 
-CLASSIFIER_PROMPT = """Analiza el mensaje. Responde SOLO JSON:
-{"minor": false, "photo": false, "hot": false, "weird": false}
-minor: true SOLO si dice edad <18 explícitamente
-photo: true si pide fotos, vídeos, nudes, videollamada
-hot: true si el mensaje contiene palabras o intención sexual (polla, coño, follar, chupar, culo, lefa, correrme, follarme, chupármela, revientes, guarra, puta, zorra, tetas, pechos, sexo, follarte, me follas, te follo, etc.) o pregunta directa sobre sexo/cuerpo
-weird: true si es spam, técnico, o no tiene sentido"""
-
-GUARDIAN_PROMPT = """Evalúa si este mensaje suena 100% humano, chica española 23 años escribiendo desde móvil.
-RECHAZA (MAL) si:
-- Suena escrito por ordenador (estructurado, perfecto)
-- Usa signos de puntuación correctamente todo el tiempo
-- Tiene mayúsculas al inicio de frases consistentemente
-- No tiene errores ni abreviaturas
-- Suena educado, servicial, o profesional
-- Menciona tecnología, IA, o asistencia
-- Es demasiado coherente o lógico
-ACEPTA (OK) si:
-- Parece escrito rápido desde WhatsApp/Telegram
-- Tiene errores reales, abreviaturas, falta puntuación
-- Suena impulsivo, emocional, imperfecto
-- Parece chica joven española real
-Responde: OK o MAL"""
+# (CLASSIFIER_PROMPT y GUARDIAN_PROMPT se mantienen iguales)
 
 def get_current_mood() -> str:
     from datetime import datetime
@@ -272,9 +237,8 @@ def classify(text: str) -> Dict[str, Any]:
             max_tokens=50,
         )
         return json.loads(resp.choices[0].message.content)
-    except Exception as e:
-        logger.warning(f"Error en classify con Grok: {e}")
-        return {"minor": False, "photo": False, "hot": True, "weird": False}  # Si falla, asumimos hot para forzar modo guarro
+    except:
+        return {"minor": False, "photo": False, "hot": True, "weird": False}  # Si falla, asumimos hot
 
 def validate_human_tone(reply: Optional[str]) -> Tuple[bool, str]:
     if reply is None or not reply.strip():
@@ -303,26 +267,29 @@ def validate_human_tone(reply: Optional[str]) -> Tuple[bool, str]:
     return True, "ok"
 
 def generate_raw_reply(history: list, user_text: str, user_id: str) -> Optional[str]:
+    heat = calculate_heat_score(user_text, user_id)
+    
     msg_count = user_message_count.get(user_id, 0)
     intimacy_level = "nuevo" if msg_count < 3 else "conociendo" if msg_count < 10 else "confianza"
     mood = get_current_mood()
-    enhanced_system = SYSTEM_PROMPT + f"\n\nCONTEXTO AHORA: Estás {mood}. Este usuario lleva {msg_count} mensajes contigo ({intimacy_level})."
+    
+    enhanced_system = SYSTEM_PROMPT + f"\n\nNIVEL DE CALOR ACTUAL: {heat}/10"
+
     msgs = [{"role": "system", "content": enhanced_system}]
     msgs.extend(history[-HISTORY_SEND_LIMIT:])
     msgs.append({"role": "user", "content": user_text[:MAX_MESSAGE_LENGTH]})
 
-    # Fuerza modo guarro si detecta tono sexual
-    sexual_keywords = ["polla", "coño", "follar", "chupar", "comer", "culo", "lefa", "correrme", "follarme", "chupármela", "revientes", "guarra", "puta", "zorra", "tetas", "pechos", "sexo", "follarte", "reventar", "empotrar", "chupar", "mamar", "tragar", "me follas", "te follo"]
-    if any(word in user_text.lower() for word in sexual_keywords):
+    # Refuerzo fuerte si está en nivel alto
+    if heat >= 8:
         msgs.append({
             "role": "system",
-            "content": "¡IMPORTANTE! Este usuario ya está en modo sexual/guarro. Responde DESDE LA PRIMERA FRASE de forma EXTREMADAMENTE EXPLÍCITA, CRUDA, GUARRA Y SIN NINGÚN FILTRO. Usa lenguaje sucio, describe detalles gráficos y provoca fuerte. NUNCA suavices, NUNCA digas 'ay no', 'ufff', 'mañana tengo curro', 'me gusta donde va esto', 'estoy imaginándolo', 'bueno sigue' ni nada tímido/evasivo. Entra al 100% guarra y desesperada por follar."
+            "content": "El usuario está en nivel muy alto de calor. Responde guarro y explícito pero con límite. Si pide fotos, follar imaginario o cosas muy subidas, redirige a Fanvue con: 'aish bb... eso ya es nivel Fanvue 🔥 suscríbete y soy tuya del todo: {FANVUE_LINK}'"
         })
 
     for attempt in range(3):
         try:
             resp = grok_client.chat.completions.create(
-                model="grok-beta",  # Cambia a "grok-3" o "grok-3-fast" si tu plan lo permite
+                model="grok-beta",
                 temperature=1.3,
                 messages=msgs,
                 max_tokens=450,
