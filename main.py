@@ -83,7 +83,6 @@ Reglas:
 - Subes intensidad solo si el usuario lo hace.
 - Natural, corta, estilo chat móvil.
 - Nunca explicas nada, nunca hablas de IA/bot.
-
 Si el usuario sube el tono → tú también."""
 
 CLASSIFIER_PROMPT = """Analiza el mensaje. Responde SOLO JSON:
@@ -108,18 +107,6 @@ ACEPTA (OK) si:
 - Suena impulsivo, emocional, imperfecto
 - Parece chica joven española real
 Responde: OK o MAL"""
-
-def get_current_mood() -> str:
-    from datetime import datetime
-    hour = datetime.now().hour
-    if 6 <= hour < 12:
-        return random.choice(MOOD_VARIANTS['morning'])
-    elif 12 <= hour < 18:
-        return random.choice(MOOD_VARIANTS['afternoon'])
-    elif 18 <= hour < 24:
-        return random.choice(MOOD_VARIANTS['night'])
-    else:
-        return random.choice(MOOD_VARIANTS['late_night'])
 
 def apply_typos_and_slang(text: str) -> str:
     result = text
@@ -269,7 +256,6 @@ def generate_raw_reply(history: list, user_text: str, user_id: str) -> Optional[
     
     msg_count = user_message_count.get(user_id, 0)
     intimacy_level = "nuevo" if msg_count < 3 else "conociendo" if msg_count < 10 else "confianza"
-    mood = get_current_mood()
     
     enhanced_system = SYSTEM_PROMPT + f"\n\nNIVEL DE CALOR ACTUAL: {heat}/10"
 
