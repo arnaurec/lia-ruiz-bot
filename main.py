@@ -20,22 +20,26 @@ logger = logging.getLogger("lia-bot")
 
 # Environment Variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GROK_API_KEY = os.getenv("GROK_API_KEY")  # ← Tu clave de xAI aquí
 PUBLIC_URL = os.getenv("PUBLIC_URL")
 PORT = int(os.getenv("PORT", "8080"))
 OWNER_CHAT_ID = os.getenv("OWNER_CHAT_ID")
 
-if not all([BOT_TOKEN, OPENAI_API_KEY, PUBLIC_URL]):
-    raise RuntimeError("Faltan env vars: BOT_TOKEN, OPENAI_API_KEY, PUBLIC_URL")
+if not all([BOT_TOKEN, GROK_API_KEY, PUBLIC_URL]):
+    raise RuntimeError("Faltan env vars: BOT_TOKEN, GROK_API_KEY, PUBLIC_URL")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Cliente para Grok (compatible con el SDK de OpenAI)
+grok_client = OpenAI(
+    api_key=GROK_API_KEY,
+    base_url="https://api.x.ai/v1",
+)
 
 memory: Dict[str, Deque[Dict[str, str]]] = {}
 user_last_message: Dict[str, float] = {}
 user_message_count: Dict[str, int] = {}
 
 MAX_HISTORY_PER_USER = 80
-OPENAI_HISTORY_LIMIT = 20
+HISTORY_SEND_LIMIT = 20  # Antes se llamaba OPENAI_HISTORY_LIMIT, ahora con nombre neutro
 MAX_MESSAGE_LENGTH = 1500
 RATE_LIMIT_SECONDS = 0.5
 
@@ -299,8 +303,8 @@ def check_rate_limit(user_id: str) -> bool:
 
 def classify(text: str) -> Dict[str, Any]:
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+        resp = grok_client.chat.completions.create(
+            model="grok-beta",
             temperature=0,
             messages=[
                 {"role": "system", "content": CLASSIFIER_PROMPT},
@@ -315,8 +319,7 @@ def classify(text: str) -> Dict[str, Any]:
 
 def validate_human_tone(reply: Optional[str]) -> Tuple[bool, str]:
     if reply is None or not reply.strip():
-        return False, "respuesta vacía o None"
-    
+        return False, "respuesta vacía o None de Grok"
     problems = []
     sentences = reply.split('. ')
     capitalized = sum(1 for s in sentences if s and s[0].isupper())
@@ -346,21 +349,24 @@ def generate_raw_reply(history: list, user_text: str, user_id: str) -> Optional[
     mood = get_current_mood()
     enhanced_system = SYSTEM_PROMPT + f"\n\nCONTEXTO AHORA: Estás {mood}. Este usuario lleva {msg_count} mensajes contigo ({intimacy_level})."
     msgs = [{"role": "system", "content": enhanced_system}]
-    msgs.extend(history[-OPENAI_HISTORY_LIMIT:])
+    msgs.extend(history[-HISTORY_SEND_LIMIT:])
     msgs.append({"role": "user", "content": user_text[:MAX_MESSAGE_LENGTH]})
-    try:
-        resp = client.chat.completions.create(
-            model="gpt-4o",
-            temperature=1.1,
-            messages=msgs,
-            max_tokens=400,
-            presence_penalty=0.3,
-            frequency_penalty=0.3,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Error en generate_raw_reply: {str(e)}")
-        return None
+    for attempt in range(3):
+        try:
+            resp = grok_client.chat.completions.create(
+                model="grok-beta",  # Cambia a "grok-3" o el modelo que tengas disponible
+                temperature=1.1,
+                messages=msgs,
+                max_tokens=400,
+                presence_penalty=0.3,
+                frequency_penalty=0.3,
+            )
+            reply = resp.choices[0].message.content.strip()
+            return reply
+        except Exception as e:
+            logger.warning(f"Error Grok intento {attempt+1}: {e}")
+            time.sleep(1.5)
+    return random.choice(FALLBACK_RESPONSES)
 
 def process_reply_to_human(reply: Optional[str], is_hot: bool = False) -> Tuple[str, Optional[str], float]:
     if reply is None or not reply.strip():
@@ -443,9 +449,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     history = get_history(conv_id)
     raw_reply = generate_raw_reply(history, user_text, user_id)
 
-    # Protección contra None antes de validate
     if raw_reply is None:
-        logger.warning("raw_reply fue None - usando fallback")
+        logger.warning("generate_raw_reply devolvió None - usando fallback")
         raw_reply = random.choice(FALLBACK_RESPONSES)
 
     is_valid, reason = validate_human_tone(raw_reply)
