@@ -303,7 +303,7 @@ def generate_raw_reply(history: list, user_text: str, user_id: str) -> Optional[
     msgs.append({"role": "user", "content": user_text[:MAX_MESSAGE_LENGTH]})
     
     # Fuerza modo guarro si detecta tono sexual
-    sexual_keywords = ["polla", "coño", "follar", "chupar", "comer", "culo", "lefa", "correrme", "follarme", "chupármela", "revientes", "guarra", "puta", "zorra", "tetas", "pechos", "sexo", "follarte"]
+    sexual_keywords = ["polla", "coño", "follar", "chupar", "comer", "culo", "lefa", "correrme", "follarme", "chupármela", "revientes", "guarra", "puta", "zorra", "tetas", "pechos", "sexo", "follarte", "guapo", "guapa", "poniendo"]
     if any(word in user_text.lower() for word in sexual_keywords):
         msgs.append({
             "role": "system",
