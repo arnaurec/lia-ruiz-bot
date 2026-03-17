@@ -347,57 +347,68 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if not msg or not msg.text:
         return
+
     user_text = msg.text.strip()
     if not user_text:
         return
 
     user_id = str(update.effective_user.id) if update.effective_user else "unknown"
+
     if not check_rate_limit(user_id):
         return
 
     conv_id, dm_topic_id = conv_id_and_topic(update)
-    logger.info(f"Mensaje recibido - conv_id: {conv_id}, dm_topic_id: {dm_topic_id}, thread: {msg.message_thread_id if msg else 'None'}, reply_to: {msg.message_id}")
 
     append_history(conv_id, "user", user_text)
 
-    # 🚨 TRIGGER DURO DE MONETIZACIÓN (paywall forzado en código)
+    # ===== HEAT + COUNT =====
     heat = calculate_heat_score(user_text, user_id)
-    if heat >= 8 or any(w in user_text.lower() for w in ["foto", "nude", "video", "videollamada", "imagina que me", "follar imaginario"]):
-        reply = random.choice(FANVUE_RESPONSES).format(link=FANVUE_LINK)
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text=reply
-        )
-        return  # ← Salimos, no generamos más respuesta
+    msg_count = user_message_count.get(user_id, 0)
 
+    # ===== TRIGGERS DUROS =====
+
+    # 1. Trigger directo por contenido
+    trigger_words = ["foto", "nude", "video", "videollamada", "imagina", "follar imaginario"]
+    if any(w in user_text.lower() for w in trigger_words):
+        reply = random.choice(FANVUE_RESPONSES)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+        return
+
+    # 2. Trigger por calor alto
+    if heat >= 10:
+        reply = random.choice(FANVUE_RESPONSES)
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+        return
+
+    # 3. Trigger por número de mensajes (muy importante para monetizar)
+    if msg_count >= 6:
+        reply = "oye… 😏 esto ya se está poniendo interesante\n" + FANVUE_LINK
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=reply)
+        return
+
+    # ===== CLASIFICACIÓN =====
     flags = classify(user_text)
 
     if flags.get("minor"):
         await alert_owner(context, f"🛑 Menor: {user_text[:100]}")
         return
 
+    # ===== API KWARGS (topics fix) =====
     api_kwargs = {}
     if dm_topic_id is not None:
         api_kwargs["direct_messages_topic_id"] = dm_topic_id
 
+    # ===== GENERACIÓN =====
     history = get_history(conv_id)
     raw_reply = generate_raw_reply(history, user_text, user_id)
 
     if raw_reply is None:
-        logger.warning("raw_reply fue None - usando fallback")
         raw_reply = random.choice(FALLBACK_RESPONSES)
 
-    is_valid, reason = validate_human_tone(raw_reply)
+    is_valid, _ = validate_human_tone(raw_reply)
 
     if not is_valid:
-        logger.warning(f"Tono no humano ({reason}): {raw_reply[:80]}...")
-        await alert_owner(context, f"⚠️ Tono raro ({reason}): {raw_reply[:100]}")
-        raw_reply = generate_raw_reply(history, user_text + " (contesta como si fueras tú, rápido, sin pensar)", user_id)
-        if raw_reply is None:
-            raw_reply = random.choice(FALLBACK_RESPONSES)
-        is_valid, reason = validate_human_tone(raw_reply)
-        if not is_valid:
-            raw_reply = random.choice(FALLBACK_RESPONSES)
+        raw_reply = random.choice(FALLBACK_RESPONSES)
 
     is_hot = flags.get("hot", False)
     part1, part2, typing_delay = process_reply_to_human(raw_reply, is_hot)
@@ -406,19 +417,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if part2:
         append_history(conv_id, "assistant", part2)
 
+    # ===== TYPING =====
     try:
         await context.bot.send_chat_action(
             chat_id=update.effective_chat.id,
             action="typing",
             **api_kwargs
         )
-    except BadRequest as e:
-        if "Chat actions can't be sent to channel direct messages chats" in str(e):
-            logger.info(f"Ignorando typing en topic canal: {conv_id}")
-        else:
-            logger.warning(f"Error typing: {e}")
-    except Exception as e:
-        logger.warning(f"Error typing: {e}")
+    except:
+        pass
 
     await asyncio.sleep(typing_delay)
 
@@ -426,60 +433,22 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if msg.message_id:
         send_kwargs["reply_to_message_id"] = msg.message_id
 
+    # ===== SEND =====
     try:
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
             text=part1,
-            **send_kwargs,
+            **send_kwargs
         )
 
         if part2:
-            try:
-                await context.bot.send_chat_action(
-                    chat_id=update.effective_chat.id,
-                    action="typing",
-                    **api_kwargs
-                )
-            except BadRequest:
-                pass
-
-            await asyncio.sleep(random.uniform(2, 6))
-
+            await asyncio.sleep(random.uniform(2, 5))
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 text=part2,
-                **send_kwargs,
+                **send_kwargs
             )
 
-    except BadRequest as e:
-        error_str = str(e).lower()
-        if "channel direct messages topic must be specified" in error_str or "topic must be specified" in error_str:
-            logger.warning(f"Error 'topic must be specified' - reintentando básico: {conv_id}")
-            try:
-                basic_kwargs = {}
-                if msg.message_id:
-                    basic_kwargs["reply_to_message_id"] = msg.message_id
-                await context.bot.send_message(
-                    chat_id=update.effective_chat.id,
-                    text=part1,
-                    **basic_kwargs
-                )
-                if part2:
-                    await asyncio.sleep(random.uniform(2, 6))
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=part2,
-                        **basic_kwargs
-                    )
-            except Exception as retry_e:
-                logger.error(f"Reintento falló: {retry_e}")
-                if OWNER_CHAT_ID:
-                    await context.bot.send_message(
-                        chat_id=int(OWNER_CHAT_ID),
-                        text=f"Error persistente en topic {conv_id}: {str(retry_e)}\nUsuario: {user_id}"
-                    )
-        else:
-            logger.error(f"Error enviando: {e}")
     except Exception as e:
         logger.error(f"Error enviando: {e}")
 
