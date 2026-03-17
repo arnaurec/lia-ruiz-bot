@@ -37,7 +37,7 @@ memory: Dict[str, Deque[Dict[str, str]]] = {}
 user_last_message: Dict[str, float] = {}
 user_message_count: Dict[str, int] = {}
 
-MAX_HISTORY_PER_USER = 80
+MAX_HISTORY_PER_USER = 2
 HISTORY_SEND_LIMIT = 20
 MAX_MESSAGE_LENGTH = 1500
 RATE_LIMIT_SECONDS = 0.5
